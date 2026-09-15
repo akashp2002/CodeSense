@@ -1,0 +1,22 @@
+[project]
+name = "codesense"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "akash", email = "akashp4010@gmail.com" }
+]
+requires-python = ">=3.11"
+dependencies = [
+    "pydantic>=2.13.5",
+    "pytest>=9.1.1",
+    "tree-sitter>=0.26.0",
+    "tree-sitter-python>=0.25.0",
+]
+
+[project.scripts]
+codesense = "codesense:main"
+
+[build-system]
+requires = ["uv_build>=0.12.14,<0.13.0"]
+build-backend = "uv_build"
