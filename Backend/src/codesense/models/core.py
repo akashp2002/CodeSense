@@ -16,6 +16,7 @@ class CodeChunk(BaseModel):
 
 class SymbolReference(BaseModel):
     file_path: str
+    caller_symbol: Optional[str] = None  # which function/method is making this reference
     symbol_name: str
     reference_type: str  # 'call', 'import', 'inheritance'
     line_number: int

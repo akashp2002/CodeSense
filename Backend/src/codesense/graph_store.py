@@ -1,0 +1,119 @@
+from neo4j import GraphDatabase
+from typing import List
+from codesense.models.core import CodeChunk, SymbolReference
+
+# Connection constants - can be overridden via env vars
+NEO4J_URI = "bolt://localhost:7687"
+NEO4J_USER = "neo4j"
+NEO4J_PASSWORD = "codesense_password"
+
+class GraphStore:
+    def __init__(self, uri: str = NEO4J_URI, user: str = NEO4J_USER, password: str = NEO4J_PASSWORD):
+        self.driver = GraphDatabase.driver(uri, auth=(user, password))
+
+    def close(self):
+        self.driver.close()
+
+    def clear_graph(self):
+        """Clear all nodes and edges (useful for re-indexing)."""
+        with self.driver.session() as session:
+            session.run("MATCH (n) DETACH DELETE n")
+
+    def index_chunks(self, chunks: List[CodeChunk]):
+        """Create nodes for each code symbol."""
+        with self.driver.session() as session:
+            for chunk in chunks:
+                session.run(
+                    """
+                    MERGE (s:Symbol {
+                        file_path: $file_path,
+                        symbol_name: $symbol_name,
+                        start_line: $start_line
+                    })
+                    SET s.chunk_type = $chunk_type,
+                        s.end_line = $end_line,
+                        s.signature = $signature,
+                        s.docstring = $docstring
+                    """,
+                    file_path=chunk.file_path,
+                    symbol_name=chunk.symbol_name,
+                    start_line=chunk.line_range.start_line,
+                    end_line=chunk.line_range.end_line,
+                    chunk_type=chunk.chunk_type,
+                    signature=chunk.signature,
+                    docstring=chunk.docstring
+                )
+
+    def index_references(self, references: List[SymbolReference]):
+        """Create edges between symbols based on references.
+        
+        When caller_symbol is known (e.g. function calling another function),
+        we create a Symbol→Symbol edge: A -[:CALLS]-> B.
+        
+        For module-level imports with no caller, we create a File→Symbol edge.
+        """
+        with self.driver.session() as session:
+            for ref in references:
+                rel_type = {
+                    "call": "CALLS",
+                    "import": "IMPORTS",
+                    "inheritance": "INHERITS_FROM"
+                }.get(ref.reference_type, "REFERENCES")
+
+                if ref.caller_symbol:
+                    # Precise edge: Symbol → [REL] → Symbol
+                    session.run(
+                        f"""
+                        MERGE (source:Symbol {{symbol_name: $caller_symbol}})
+                        MERGE (target:Symbol {{symbol_name: $callee_symbol}})
+                        MERGE (source)-[:{rel_type} {{line: $line_number, file: $file_path}}]->(target)
+                        """,
+                        caller_symbol=ref.caller_symbol,
+                        callee_symbol=ref.symbol_name,
+                        line_number=ref.line_number,
+                        file_path=ref.file_path
+                    )
+                else:
+                    # Module-level: File → [REL] → Symbol (for imports)
+                    session.run(
+                        f"""
+                        MERGE (source:File {{path: $file_path}})
+                        MERGE (target:Symbol {{symbol_name: $symbol_name}})
+                        MERGE (source)-[:{rel_type} {{line: $line_number}}]->(target)
+                        """,
+                        file_path=ref.file_path,
+                        symbol_name=ref.symbol_name,
+                        line_number=ref.line_number
+                    )
+
+
+    def get_dependents(self, symbol_name: str, max_hops: int = 3) -> List[dict]:
+        """
+        Find all files/symbols that transitively depend on a given symbol.
+        i.e., the blast radius if this symbol changes.
+        """
+        with self.driver.session() as session:
+            result = session.run(
+                f"""
+                MATCH (target:Symbol {{symbol_name: $symbol_name}})
+                MATCH (source)-[:CALLS|IMPORTS|INHERITS_FROM*1..{max_hops}]->(target)
+                RETURN DISTINCT source.path AS file_path, source.symbol_name AS symbol_name,
+                       labels(source) AS node_type
+                """,
+                symbol_name=symbol_name
+            )
+            return [dict(record) for record in result]
+
+    def get_callees(self, symbol_name: str) -> List[dict]:
+        """
+        Find all symbols that a given symbol depends on (outward edges).
+        """
+        with self.driver.session() as session:
+            result = session.run(
+                """
+                MATCH (source:Symbol {symbol_name: $symbol_name})-[:CALLS|IMPORTS]->(target)
+                RETURN DISTINCT target.symbol_name AS symbol_name, target.file_path AS file_path
+                """,
+                symbol_name=symbol_name
+            )
+            return [dict(record) for record in result]
