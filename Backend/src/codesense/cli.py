@@ -101,6 +101,16 @@ def impact_analysis(symbol_name: str, max_hops: int):
     result = agent.get_impact(symbol_name, max_hops=max_hops)
     print(f"\n{result['summary']}")
 
+from dotenv import load_dotenv
+load_dotenv()
+
+def query_supervisor(question: str):
+    from codesense.agents.supervisor import SupervisorAgent
+    agent = SupervisorAgent()
+    print(f"\n--- CodeSense: Answering '{question}' ---")
+    answer = agent.run(question)
+    print(f"\n{answer}\n")
+
 def main():
     parser = argparse.ArgumentParser(description="CodeSense CLI")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -117,6 +127,9 @@ def main():
     impact_parser = subparsers.add_parser("impact", help="Dependency impact analysis")
     impact_parser.add_argument("symbol", help="Symbol name to analyze")
     impact_parser.add_argument("--hops", type=int, default=3, help="Max traversal hops (default: 3)")
+
+    query_parser = subparsers.add_parser("query", help="Ask CodeSense a natural language question")
+    query_parser.add_argument("question", help="The question to ask")
     
     args = parser.parse_args()
     
@@ -128,6 +141,8 @@ def main():
         search_repo(args.query)
     elif args.command == "impact":
         impact_analysis(args.symbol, args.hops)
+    elif args.command == "query":
+        query_supervisor(args.question)
 
 if __name__ == "__main__":
     main()
