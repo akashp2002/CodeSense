@@ -29,6 +29,7 @@ dist/
 *.egg-info/
 
 .qdrant_db/
+repos/
 
 # Coverage
 .coverage

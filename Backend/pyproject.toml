@@ -8,6 +8,8 @@ authors = [
 ]
 requires-python = ">=3.11"
 dependencies = [
+    "fastapi>=0.141.1",
+    "gitpython>=3.1.62",
     "langchain-groq>=1.1.3",
     "langgraph>=1.2.11",
     "neo4j>=6.3.1",
@@ -15,13 +17,18 @@ dependencies = [
     "pytest>=9.1.1",
     "python-dotenv>=1.2.3",
     "qdrant-client>=1.19.0",
+    "requests>=2.34.2",
     "sentence-transformers>=6.0.1",
+    "streamlit>=1.64.0",
+    "streamlit-agraph>=0.0.45",
     "tree-sitter>=0.26.0",
     "tree-sitter-python>=0.25.0",
+    "uvicorn[standard]>=0.53.0",
 ]
 
 [project.scripts]
-codesense = "codesense:main"
+codesense = "codesense.cli:main"
+codesense-api = "codesense.api:start"
 
 [build-system]
 requires = ["uv_build>=0.12.14,<0.13.0"]

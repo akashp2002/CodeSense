@@ -117,3 +117,52 @@ class GraphStore:
                 symbol_name=symbol_name
             )
             return [dict(record) for record in result]
+
+    def get_neighborhood(self, symbol_name: str, max_hops: int = 2) -> dict:
+        """
+        Get the local graph neighborhood around a symbol for visualization.
+        Returns a dict with 'nodes' and 'edges'.
+        """
+        with self.driver.session() as session:
+            # Query for paths up to max_hops away (both incoming and outgoing)
+            result = session.run(
+                f"""
+                MATCH path = (start:Symbol {{symbol_name: $symbol_name}})-[*1..{max_hops}]-(other)
+                RETURN path
+                """,
+                symbol_name=symbol_name
+            )
+            
+            nodes = {}
+            edges = set()
+            
+            # Also add the starting node itself in case it has no edges
+            start_result = session.run(
+                "MATCH (n:Symbol {symbol_name: $symbol_name}) RETURN n", 
+                symbol_name=symbol_name
+            )
+            for record in start_result:
+                node = record["n"]
+                nodes[node["symbol_name"]] = dict(node)
+                
+            for record in result:
+                path = record["path"]
+                for node in path.nodes:
+                    if "symbol_name" in node:
+                        nodes[node["symbol_name"]] = dict(node)
+                    elif "path" in node: # File node
+                        nodes[node["path"]] = dict(node)
+                        
+                for rel in path.relationships:
+                    start_node = rel.start_node
+                    end_node = rel.end_node
+                    start_id = start_node.get("symbol_name") or start_node.get("path")
+                    end_id = end_node.get("symbol_name") or end_node.get("path")
+                    if start_id and end_id:
+                        edges.add((start_id, end_id, type(rel).__name__))
+                        
+            return {
+                "nodes": [{"id": k, **v} for k, v in nodes.items()],
+                "edges": [{"source": s, "target": t, "label": l} for s, t, l in edges]
+            }
+

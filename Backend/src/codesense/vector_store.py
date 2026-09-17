@@ -25,6 +25,14 @@ class VectorStore:
                     distance=models.Distance.COSINE
                 )
             )
+
+    def clear_collection(self):
+        """Delete and recreate the collection to wipe all old data."""
+        try:
+            self.client.delete_collection(self.collection_name)
+        except Exception:
+            pass
+        self._ensure_collection()
             
     def index_chunks(self, chunks: List[CodeChunk]):
         if not chunks:

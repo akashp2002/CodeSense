@@ -91,10 +91,8 @@ class SupervisorAgent:
         return state
 
     def _route_after_search(self, state: CodeSenseState) -> str:
-        """Route to explainer only if the intent was 'explain'."""
-        if state.get("intent") == "explain":
-            return "explainer"
-        return END
+        """Always route to explainer to synthesize search results into a natural language answer."""
+        return "explainer"
 
     def _build_graph(self):
         workflow = StateGraph(CodeSenseState)
@@ -156,15 +154,8 @@ class SupervisorAgent:
         if result_state.get("error"):
             return f"Error: {result_state['error']}"
             
-        # Return the final explainer answer, or format the raw results if it bypassed the explainer
+        # Return the final explainer answer
         if result_state.get("final_answer"):
             return result_state["final_answer"]
-            
-        if result_state.get("intent") == "search" and result_state.get("search_results"):
-            # Format search results
-            out = ["Search Results:"]
-            for r in result_state["search_results"]:
-                out.append(f"[{r['rank']}] {r['file_path']} - {r['symbol_name']}")
-            return "\n".join(out)
             
         return "No answer generated."
