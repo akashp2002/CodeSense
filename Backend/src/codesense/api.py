@@ -1,12 +1,17 @@
 import os
 import uvicorn
+from pathlib import Path
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional
 
 from codesense.agents.supervisor import SupervisorAgent
-from codesense.ingestion.github_loader import clone_repository
+from codesense.ingestion.github_loader import (
+    clone_repository,
+    create_pull_request,
+    delete_repository,
+)
 from codesense.cli import index_repo, graph_index_repo
 
 app = FastAPI(title="CodeSense API", description="AI Agent for Codebase QA & Impact Analysis")
@@ -50,11 +55,20 @@ class CloneRequest(BaseModel):
 class IndexRequest(BaseModel):
     repo_path: str
 
+class DeleteRepositoryRequest(BaseModel):
+    repo_path: str
+
 class QueryRequest(BaseModel):
     question: str
 
 class QueryResponse(BaseModel):
     answer: str
+    requires_approval: bool = False
+    diff_data: Optional[str] = None
+
+class CreatePRRequest(BaseModel):
+    prompt: str
+    repo_name: str
 
 # ── Endpoints ──
 
@@ -67,9 +81,24 @@ def api_clone(request: CloneRequest):
     """Clone a GitHub repository to the local repos/ directory."""
     try:
         result = clone_repository(request.github_url)
+        os.environ["CODESENSE_REPO_PATH"] = result["local_path"]
         return result
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+@app.post("/delete-repository")
+def api_delete_repository(request: DeleteRepositoryRequest):
+    """Delete the currently selected cloned repository."""
+    reset_supervisor()
+    try:
+        delete_repository(request.repo_path)
+        if os.environ.get("CODESENSE_REPO_PATH") == request.repo_path:
+            os.environ.pop("CODESENSE_REPO_PATH", None)
+        return {"status": "deleted"}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Could not delete repository: {e}") from e
 
 @app.post("/index-vectors")
 def api_index_vectors(request: IndexRequest):
@@ -81,7 +110,6 @@ def api_index_vectors(request: IndexRequest):
     reset_supervisor()
     
     try:
-        import shutil
         from pathlib import Path
         from codesense.ingestion.parser import CodeParser
         from codesense.ingestion.chunker import SemanticChunker
@@ -91,22 +119,13 @@ def api_index_vectors(request: IndexRequest):
         
         path = Path(request.repo_path)
         
-        # ── NUCLEAR FIX: Physically delete the database folder to guarantee wipe ──
-        db_path = Path(".qdrant_db")
-        if db_path.exists():
-            # Try to release locks by garbage collecting first
-            import gc
-            gc.collect()
-            try:
-                shutil.rmtree(db_path, ignore_errors=True)
-            except Exception:
-                pass
-        
         parser = CodeParser()
         chunker = SemanticChunker()
         vector_store = VectorStore()
+        vector_store.clear_collection()
         
         all_chunks = []
+        parse_errors = []
         for file_path in path.rglob("*.py"):
             # Use relative path so we only skip dirs INSIDE the repo, not parent dirs
             rel_parts = file_path.relative_to(path).parts
@@ -116,14 +135,28 @@ def api_index_vectors(request: IndexRequest):
                 tree, code = parser.parse_file(str(file_path))
                 chunks = chunker.chunk_node(tree.root_node, code, str(file_path))
                 all_chunks.extend(chunks)
-            except Exception:
-                pass
-        
-        vector_store.index_chunks(all_chunks)
-        # Close the Qdrant client to release the file lock
-        vector_store.client.close()
-        
-        return {"chunk_count": len(all_chunks)}
+            except Exception as exc:
+                parse_errors.append(f"{file_path}: {exc}")
+
+        try:
+            vector_store.index_chunks(all_chunks)
+            return {
+                "chunk_count": len(all_chunks),
+                "parse_error_count": len(parse_errors),
+                "parse_errors": parse_errors[:10],
+            }
+        finally:
+            vector_store.client.close()
+    except RuntimeError as e:
+        if "already accessed by another instance" in str(e):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "The semantic index is in use by another CodeSense process. "
+                    "Stop other Uvicorn/CodeSense processes and retry indexing."
+                ),
+            ) from e
+        raise HTTPException(status_code=500, detail=str(e)) from e
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -198,14 +231,42 @@ def api_query(request: QueryRequest):
     """Natural language Q&A using the LangGraph Supervisor."""
     agent = get_supervisor()
     try:
-        answer = agent.run(request.question)
-        return {"answer": answer}
+        result_state = agent.run(request.question)
+        if "error" in result_state and result_state["error"]:
+            raise HTTPException(status_code=500, detail=result_state["error"])
+            
+        answer = result_state.get("final_answer", "No answer generated.")
+        
+        return {
+            "answer": answer,
+            "requires_approval": result_state.get("requires_approval", False),
+            "diff_data": result_state.get("diff_data")
+        }
     except Exception as e:
+        import traceback
+        print(f"\n{'='*60}")
+        print(f"ERROR in /query endpoint:")
+        print(f"{'='*60}")
+        traceback.print_exc()
+        print(f"{'='*60}\n")
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/create-pr")
+def api_create_pr(request: CreatePRRequest):
+    """Resume the refactor flow to push the PR after human approval."""
+    try:
+        repo_path = os.getenv("CODESENSE_REPO_PATH")
+        if not repo_path:
+            repo_path = str(Path("repos") / request.repo_name)
+
+        pull_request_url = create_pull_request(repo_path, request.prompt)
+        return {"status": "success", "message": f"Pull Request created: {pull_request_url}"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Could not create Pull Request: {e}") from e
 
 def start():
     """Entry point for the CLI to start the server."""
-    uvicorn.run("codesense.api:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run("codesense.api:app", host="0.0.0.0", port=8000, reload=True, reload_dirs=["src"])
 
 if __name__ == "__main__":
     start()

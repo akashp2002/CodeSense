@@ -1,12 +1,18 @@
+from pathlib import Path
+
 from qdrant_client import QdrantClient
 from qdrant_client.http import models
 from sentence_transformers import SentenceTransformer
 from codesense.models.core import CodeChunk
 from typing import List
 
+DEFAULT_QDRANT_PATH = Path(__file__).resolve().parents[2] / ".qdrant_db"
+
+
 class VectorStore:
-    def __init__(self, collection_name: str = "code_chunks", path: str = ".qdrant_db"):
-        self.client = QdrantClient(path=path)
+    def __init__(self, collection_name: str = "code_chunks", path: str | None = None):
+        storage_path = str(DEFAULT_QDRANT_PATH if path is None else path)
+        self.client = QdrantClient(path=storage_path)
         self.collection_name = collection_name
         # Using a fast, lightweight local embedding model
         self.model = SentenceTransformer("all-MiniLM-L6-v2")

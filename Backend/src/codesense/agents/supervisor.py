@@ -1,4 +1,6 @@
 import os
+import subprocess
+from pathlib import Path
 from typing import Literal
 from pydantic import BaseModel, Field
 from langchain_groq import ChatGroq
@@ -9,11 +11,12 @@ from codesense.agents.dependency_graph import DependencyGraphAgent
 from codesense.agents.explainer import ExplainerAgent
 
 class IntentClassification(BaseModel):
-    intent: Literal["search", "impact", "explain"] = Field(
+    intent: Literal["search", "impact", "explain", "refactor"] = Field(
         description="The classified intent of the user's question. "
                     "'search' for finding where something is or how it's implemented. "
                     "'impact' for questions about blast radius, dependencies, or what breaks if something changes. "
                     "'explain' for general architectural or 'how does it work' questions."
+                    "'refactor' for requests to change, rename, rewrite, or refactor code."
     )
     extracted_symbol: str | None = Field(
         description="If the intent is 'impact', the specific symbol (function/class name) the user is asking about. Otherwise null.",
@@ -21,13 +24,16 @@ class IntentClassification(BaseModel):
     )
 
 class SupervisorAgent:
-    def __init__(self, model_name: str = "openai/gpt-oss-20b"):
+    def __init__(self, model_name: str = "qwen/qwen3.8-27b"):
         self.llm = ChatGroq(model_name=model_name, temperature=0).with_structured_output(IntentClassification)
         
         # Initialize specialist tools
         self.search_agent = SemanticSearchAgent()
         self.graph_agent = DependencyGraphAgent()
         self.explainer_agent = ExplainerAgent(model_name=model_name)
+        
+        from codesense.agents.refactor import RefactorAgent
+        self.refactor_agent = RefactorAgent()  # Uses its own tool-calling model
         
         # Build the graph
         self.graph = self._build_graph()
@@ -60,6 +66,8 @@ class SupervisorAgent:
             return "dependency_graph"
         elif intent == "search":
             return "semantic_search"
+        elif intent == "refactor":
+            return "refactor_node"
         else:
             # Explain usually requires searching first to get context, so we route to search then explain
             return "semantic_search"
@@ -90,6 +98,43 @@ class SupervisorAgent:
         state["impact_results"] = results
         return state
 
+    def _run_refactor(self, state: CodeSenseState) -> CodeSenseState:
+        """Node: Refactor Specialist (MCP)"""
+        print(f"Refactor Agent: Processing request '{state['question']}'")
+        try:
+            diff_result = self.refactor_agent.run_sync(state["question"], phase="refactor")
+            state["diff_data"] = diff_result
+            state["requires_approval"] = True
+            state["final_answer"] = "I have drafted the refactor. Please review the diff below and approve to create a PR."
+        except TimeoutError as error:
+            # The agent may have completed the edit before its final response timed out.
+            repo_path = os.getenv("CODESENSE_REPO_PATH") or str(
+                Path.cwd() / "repos" / "demo"
+            )
+            if repo_path:
+                diff_result = subprocess.run(
+                    ["git", "--no-pager", "diff"],
+                    cwd=repo_path,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                ).stdout.strip()
+            else:
+                diff_result = ""
+
+            if diff_result:
+                state["diff_data"] = diff_result
+                state["requires_approval"] = True
+                state["final_answer"] = (
+                    "The refactor was applied, but the agent timed out while preparing its response. "
+                    "Please review the recovered diff below."
+                )
+            else:
+                state["error"] = str(error)
+        except Exception as e:
+            state["error"] = f"Refactor failed: {e}"
+        return state
+
     def _route_after_search(self, state: CodeSenseState) -> str:
         """Always route to explainer to synthesize search results into a natural language answer."""
         return "explainer"
@@ -102,6 +147,7 @@ class SupervisorAgent:
         workflow.add_node("semantic_search", self._run_semantic_search)
         workflow.add_node("dependency_graph", self._run_dependency_graph)
         workflow.add_node("explainer", self.explainer_agent.generate_explanation)
+        workflow.add_node("refactor_node", self._run_refactor)
 
         # Edges
         workflow.add_edge(START, "supervisor")
@@ -113,6 +159,7 @@ class SupervisorAgent:
             {
                 "semantic_search": "semantic_search",
                 "dependency_graph": "dependency_graph",
+                "refactor_node": "refactor_node",
                 END: END
             }
         )
@@ -130,15 +177,18 @@ class SupervisorAgent:
         # After dependency graph, always go to explainer to synthesize
         workflow.add_edge("dependency_graph", "explainer")
         
+        # After refactor, we pause for UI approval
+        workflow.add_edge("refactor_node", END)
+        
         # After explainer, we're done
         workflow.add_edge("explainer", END)
 
         return workflow.compile()
 
-    def run(self, question: str) -> str:
-        """Execute the LangGraph workflow for a given question."""
+    def run(self, question: str) -> dict:
+        """Execute the LangGraph workflow for a given question and return the state dict."""
         if not os.getenv("GROQ_API_KEY"):
-            return "Error: GROQ_API_KEY environment variable is missing. Please set it in your .env file."
+            return {"error": "Error: GROQ_API_KEY environment variable is missing. Please set it in your .env file."}
             
         initial_state = CodeSenseState(
             question=question,
@@ -146,16 +196,11 @@ class SupervisorAgent:
             search_results=None,
             impact_results=None,
             final_answer=None,
-            error=None
+            error=None,
+            requires_approval=False,
+            diff_data=None
         )
         
         result_state = self.graph.invoke(initial_state)
         
-        if result_state.get("error"):
-            return f"Error: {result_state['error']}"
-            
-        # Return the final explainer answer
-        if result_state.get("final_answer"):
-            return result_state["final_answer"]
-            
-        return "No answer generated."
+        return result_state

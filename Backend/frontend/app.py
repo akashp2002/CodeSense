@@ -17,6 +17,8 @@ if "repo_stats" not in st.session_state:
     st.session_state.repo_stats = {}
 if "messages" not in st.session_state:
     st.session_state.messages = []
+if "pending_pr_request" not in st.session_state:
+    st.session_state.pending_pr_request = None
 
 # ── Header ──
 st.title("🧠 CodeSense")
@@ -137,14 +139,26 @@ else:
         f"{stats.get('relationships', '?')} dependencies"
     )
 
-    # Button to disconnect and start over
-    if st.button("Disconnect Repository"):
-        st.session_state.repo_ready = False
-        st.session_state.repo_name = ""
-        st.session_state.repo_path = ""
-        st.session_state.repo_stats = {}
-        st.session_state.messages = []
-        st.rerun()
+    # Delete the managed clone before starting over.
+    if st.button("Remove Repository"):
+        try:
+            res = requests.post(
+                f"{API_BASE}/delete-repository",
+                json={"repo_path": st.session_state.repo_path},
+                timeout=30,
+            )
+            if res.status_code != 200:
+                st.error(f"Could not remove repository: {res.text}")
+            else:
+                st.session_state.repo_ready = False
+                st.session_state.repo_name = ""
+                st.session_state.repo_path = ""
+                st.session_state.repo_stats = {}
+                st.session_state.messages = []
+                st.session_state.pending_pr_request = None
+                st.rerun()
+        except requests.exceptions.RequestException as e:
+            st.error(f"Could not connect to CodeSense API: {e}")
 
     st.markdown("---")
     st.subheader("💬 Ask CodeSense")
@@ -155,22 +169,65 @@ else:
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
 
-    # React to user input
-    if prompt := st.chat_input("Ask a question about your codebase..."):
-        st.chat_message("user").markdown(prompt)
-        st.session_state.messages.append({"role": "user", "content": prompt})
+    # Display pending PR approval if any
+    if st.session_state.pending_pr_request:
+        st.markdown("### ⚠️ Approval Required")
+        st.info("The Refactor Agent has drafted the following changes. Please review them before creating a PR.")
+        st.code(st.session_state.pending_pr_request["diff_data"], language="diff")
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("✅ Approve & Create PR", use_container_width=True, type="primary"):
+                with st.spinner("Creating Pull Request..."):
+                    try:
+                        res = requests.post(f"{API_BASE}/create-pr", json={
+                            "prompt": st.session_state.pending_pr_request["prompt"],
+                            "repo_name": st.session_state.repo_name
+                        }, timeout=180)
+                        if res.status_code == 200:
+                            st.success(res.json().get("message", "PR Created!"))
+                            st.session_state.messages.append({"role": "assistant", "content": res.json().get("message")})
+                        else:
+                            try:
+                                error_detail = res.json().get("detail", res.text)
+                            except ValueError:
+                                error_detail = res.text
+                            st.error(f"Failed to create PR: {error_detail}")
+                    except Exception as e:
+                        st.error(f"Error: {e}")
+                st.session_state.pending_pr_request = None
+                st.rerun()
+                
+        with col2:
+            if st.button("❌ Cancel", use_container_width=True):
+                st.session_state.pending_pr_request = None
+                st.rerun()
+                
+    else:
+        # React to user input only if not waiting for approval
+        if prompt := st.chat_input("Ask a question or request a refactor..."):
+            st.chat_message("user").markdown(prompt)
+            st.session_state.messages.append({"role": "user", "content": prompt})
 
-        with st.chat_message("assistant"):
-            with st.spinner("Analyzing..."):
-                try:
-                    response = requests.post(f"{API_BASE}/query", json={"question": prompt}, timeout=120)
-                    if response.status_code == 200:
-                        answer = response.json().get("answer", "No answer returned.")
-                        st.markdown(answer)
-                        st.session_state.messages.append({"role": "assistant", "content": answer})
-                    else:
-                        st.error(f"Error: {response.text}")
-                except requests.exceptions.ConnectionError:
-                    st.error("Could not connect to CodeSense API. Is FastAPI running?")
-                except Exception as e:
-                    st.error(f"Failed: {e}")
+            with st.chat_message("assistant"):
+                with st.spinner("Analyzing..."):
+                    try:
+                        response = requests.post(f"{API_BASE}/query", json={"question": prompt}, timeout=300)
+                        if response.status_code == 200:
+                            data = response.json()
+                            answer = data.get("answer", "No answer returned.")
+                            st.markdown(answer)
+                            st.session_state.messages.append({"role": "assistant", "content": answer})
+                            
+                            if data.get("requires_approval"):
+                                st.session_state.pending_pr_request = {
+                                    "prompt": prompt,
+                                    "diff_data": data.get("diff_data")
+                                }
+                                st.rerun()
+                        else:
+                            st.error(f"Error: {response.text}")
+                    except requests.exceptions.ConnectionError:
+                        st.error("Could not connect to CodeSense API. Is FastAPI running?")
+                    except Exception as e:
+                        st.error(f"Failed: {e}")
