@@ -24,6 +24,7 @@ def print_user(user: User):
     assert len(import_refs) == 2
     # imports are module-level, so caller_symbol should be None
     assert all(r.caller_symbol is None for r in import_refs)
+    assert {r.symbol_name for r in import_refs} == {"os", "BaseModel"}
     
     inheritance_refs = [r for r in refs if r.reference_type == 'inheritance']
     assert len(inheritance_refs) == 1

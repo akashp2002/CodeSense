@@ -55,11 +55,6 @@ class SymbolExtractor:
             if func_node:
                 symbol_name = code[func_node.start_byte:func_node.end_byte].decode('utf8')
                 
-                # Strip object prefixes (e.g., 'vector_store.index_chunks' -> 'index_chunks')
-                # This ensures the caller connects to the method definition, which is just named 'index_chunks'.
-                if '.' in symbol_name:
-                    symbol_name = symbol_name.split('.')[-1]
-                    
                 refs.append(SymbolReference(
                     file_path=file_path,
                     caller_symbol=current_scope,
@@ -86,7 +81,7 @@ class SymbolExtractor:
                 module_name = code[module_name_node.start_byte:module_name_node.end_byte].decode('utf8')
                 for child in node.children:
                     if child.type == 'dotted_name' and child != module_name_node:
-                        symbol_name = f"{module_name}.{code[child.start_byte:child.end_byte].decode('utf8')}"
+                        symbol_name = code[child.start_byte:child.end_byte].decode('utf8').split('.')[-1]
                         refs.append(SymbolReference(
                             file_path=file_path,
                             caller_symbol=None,

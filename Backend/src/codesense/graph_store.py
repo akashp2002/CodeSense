@@ -74,12 +74,14 @@ class GraphStore:
                         file_path=ref.file_path
                     )
                 else:
-                    # Module-level: File → [REL] → Symbol (for imports)
+                    # Module-level imports should point at indexed definitions when available.
                     session.run(
                         f"""
                         MERGE (source:File {{path: $file_path}})
-                        MERGE (target:Symbol {{symbol_name: $symbol_name}})
-                        MERGE (source)-[:{rel_type} {{line: $line_number}}]->(target)
+                        WITH source
+                        OPTIONAL MATCH (target:Symbol {{symbol_name: $symbol_name}})
+                        FOREACH (resolved_target IN CASE WHEN target IS NULL THEN [] ELSE [target] END |
+                            MERGE (source)-[:{rel_type} {{line: $line_number}}]->(resolved_target))
                         """,
                         file_path=ref.file_path,
                         symbol_name=ref.symbol_name,
@@ -95,9 +97,12 @@ class GraphStore:
         with self.driver.session() as session:
             result = session.run(
                 f"""
-                MATCH (target:Symbol {{symbol_name: $symbol_name}})
+                     MATCH (target:Symbol)
+                     WHERE target.symbol_name = $symbol_name
+                         OR toLower(target.file_path) CONTAINS toLower($symbol_name)
                 MATCH (source)-[:CALLS|IMPORTS|INHERITS_FROM*1..{max_hops}]->(target)
-                RETURN DISTINCT source.path AS file_path, source.symbol_name AS symbol_name,
+                  RETURN DISTINCT coalesce(source.file_path, source.path) AS file_path,
+                      source.symbol_name AS symbol_name,
                        labels(source) AS node_type
                 """,
                 symbol_name=symbol_name

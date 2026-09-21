@@ -1,4 +1,5 @@
 import os
+import re
 import subprocess
 from pathlib import Path
 from typing import Literal
@@ -25,7 +26,11 @@ class IntentClassification(BaseModel):
 
 class SupervisorAgent:
     def __init__(self, model_name: str = "qwen/qwen3.8-27b"):
-        self.llm = ChatGroq(model_name=model_name, temperature=0).with_structured_output(IntentClassification)
+        self.llm = ChatGroq(
+            model_name=model_name,
+            temperature=0,
+            max_tokens=128,
+        ).with_structured_output(IntentClassification)
         
         # Initialize specialist tools
         self.search_agent = SemanticSearchAgent()
@@ -53,8 +58,32 @@ class SupervisorAgent:
             
             print(f"Supervisor: Classified intent as '{state['intent']}'")
         except Exception as e:
-            state["error"] = f"Failed to classify intent: {e}"
+            fallback = self._fallback_intent(state["question"], e)
+            if fallback:
+                state["intent"], state["_target_symbol"] = fallback
+                print(
+                    f"Supervisor: Model classification unavailable; "
+                    f"using fallback intent '{state['intent']}'"
+                )
+            else:
+                state["error"] = f"Failed to classify intent: {e}"
         return state
+
+    @staticmethod
+    def _fallback_intent(question: str, error: Exception):
+        """Keep simple impact questions usable when the classifier is rate-limited."""
+        error_text = str(error).lower()
+        if "429" not in error_text and "rate_limit" not in error_text and "token" not in error_text:
+            return None
+
+        words = re.findall(r"[A-Za-z_][A-Za-z0-9_]*", question)
+        lowered = {word.lower() for word in words}
+        impact_terms = {"impact", "effect", "affect", "depend", "dependencies", "files", "break"}
+        if lowered & impact_terms:
+            symbols = [word for word in words if "_" in word or word[:1].isupper()]
+            symbol = next((word for word in symbols if word.lower() not in {"what", "files"}), None)
+            return "impact", symbol
+        return None
 
     def _route(self, state: CodeSenseState) -> str:
         """Conditional router based on intent."""
@@ -81,7 +110,9 @@ class SupervisorAgent:
 
     def _run_dependency_graph(self, state: CodeSenseState) -> CodeSenseState:
         """Node: Dependency Graph Specialist"""
-        symbol = state.get("_target_symbol")
+        symbol = self._normalize_impact_target(
+            state.get("_target_symbol"), state["question"]
+        )
         
         if not symbol:
             # Fallback heuristic: find CamelCase or snake_case words if LLM failed to extract
@@ -98,14 +129,40 @@ class SupervisorAgent:
         state["impact_results"] = results
         return state
 
+    @staticmethod
+    def _normalize_impact_target(extracted_symbol: str | None, question: str) -> str:
+        """Avoid generic classifier words becoming the dependency target."""
+        generic = {
+            "a", "affect", "change", "changing", "effect", "effected", "files",
+            "impact", "need", "other", "replace", "replacing", "what", "will",
+        }
+        if extracted_symbol and extracted_symbol.lower() not in generic:
+            return extracted_symbol
+
+        words = re.findall(r"[A-Za-z_][A-Za-z0-9_]*", question)
+        ignored = generic | {"the", "to", "does", "is", "it", "i"}
+        candidates = [word for word in words if word.lower() not in ignored]
+        identifier_candidates = [
+            word for word in candidates if "_" in word or word[:1].isupper()
+        ]
+        if identifier_candidates:
+            return identifier_candidates[0]
+        if candidates:
+            return candidates[0]
+        return extracted_symbol or question.split()[0]
+
     def _run_refactor(self, state: CodeSenseState) -> CodeSenseState:
         """Node: Refactor Specialist (MCP)"""
         print(f"Refactor Agent: Processing request '{state['question']}'")
         try:
             diff_result = self.refactor_agent.run_sync(state["question"], phase="refactor")
+            index_status = self._refresh_indexes()
             state["diff_data"] = diff_result
             state["requires_approval"] = True
-            state["final_answer"] = "I have drafted the refactor. Please review the diff below and approve to create a PR."
+            state["final_answer"] = (
+                "I have drafted the refactor. Please review the diff below and approve to create a PR.\n\n"
+                f"{index_status}"
+            )
         except TimeoutError as error:
             # The agent may have completed the edit before its final response timed out.
             repo_path = os.getenv("CODESENSE_REPO_PATH") or str(
@@ -123,17 +180,36 @@ class SupervisorAgent:
                 diff_result = ""
 
             if diff_result:
+                index_status = self._refresh_indexes()
                 state["diff_data"] = diff_result
                 state["requires_approval"] = True
                 state["final_answer"] = (
                     "The refactor was applied, but the agent timed out while preparing its response. "
-                    "Please review the recovered diff below."
+                    f"Please review the recovered diff below.\n\n{index_status}"
                 )
             else:
                 state["error"] = str(error)
         except Exception as e:
             state["error"] = f"Refactor failed: {e}"
         return state
+
+    def _refresh_indexes(self) -> str:
+        """Rebuild search and dependency indexes after a working-tree refactor."""
+        repo_path = os.getenv("CODESENSE_REPO_PATH") or str(Path.cwd() / "repos" / "demo")
+        try:
+            self.search_agent.vector_store.client.close()
+            self.graph_agent.graph_store.close()
+
+            from codesense.cli import refresh_indexes
+            from codesense.agents.semantic_search import SemanticSearchAgent
+            from codesense.agents.dependency_graph import DependencyGraphAgent
+
+            refresh_indexes(repo_path)
+            self.search_agent = SemanticSearchAgent()
+            self.graph_agent = DependencyGraphAgent()
+            return "Semantic and dependency indexes refreshed from the edited working tree."
+        except Exception as error:
+            return f"Index refresh failed; search results may be stale: {error}"
 
     def _route_after_search(self, state: CodeSenseState) -> str:
         """Always route to explainer to synthesize search results into a natural language answer."""

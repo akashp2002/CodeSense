@@ -38,7 +38,9 @@ def index_repo(repo_path: str):
             print(f"Error parsing {file_path}: {e}")
             
     print(f"\nExtracted a total of {len(all_chunks)} chunks. Embedding and indexing...")
+    vector_store.clear_collection()
     vector_store.index_chunks(all_chunks)
+    vector_store.client.close()
     print("Vector indexing complete.")
 
 def graph_index_repo(repo_path: str):
@@ -75,6 +77,12 @@ def graph_index_repo(repo_path: str):
     graph_store.index_references(all_refs)
     graph_store.close()
     print("Graph indexing complete.")
+
+
+def refresh_indexes(repo_path: str):
+    """Rebuild both indexes from the repository's current working tree."""
+    index_repo(repo_path)
+    graph_index_repo(repo_path)
 
 def search_repo(query: str):
     agent = SemanticSearchAgent()
