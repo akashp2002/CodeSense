@@ -11,3 +11,7 @@ wheels/
 
 # Local vector indexes
 .qdrant_db*/
+
+# Local service logs
+api*.log
+streamlit*.log

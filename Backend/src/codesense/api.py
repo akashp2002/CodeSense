@@ -1,10 +1,13 @@
 import os
 import uvicorn
 from pathlib import Path
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional
+from dotenv import load_dotenv
+
+load_dotenv(Path(__file__).resolve().parents[2] / ".env")
 
 from codesense.agents.supervisor import SupervisorAgent
 from codesense.ingestion.github_loader import (
@@ -13,6 +16,9 @@ from codesense.ingestion.github_loader import (
     delete_repository,
 )
 from codesense.cli import index_repo, graph_index_repo
+from codesense.graph_store import GraphStore, NEO4J_URI
+from codesense.vector_store import DEFAULT_QDRANT_PATH
+from qdrant_client import QdrantClient
 
 app = FastAPI(title="CodeSense API", description="AI Agent for Codebase QA & Impact Analysis")
 
@@ -74,7 +80,48 @@ class CreatePRRequest(BaseModel):
 
 @app.get("/health")
 def health_check():
-    return {"status": "ok"}
+    """Report readiness of the API's external dependencies without loading the LLM."""
+    checks = {}
+
+    groq_key = os.getenv("GROQ_API_KEY", "")
+    checks["llm"] = {
+        "status": "ok" if groq_key and not groq_key.startswith("your_") else "error",
+        "configured": bool(groq_key and not groq_key.startswith("your_")),
+    }
+
+    qdrant_client = None
+    try:
+        qdrant_client = QdrantClient(path=str(DEFAULT_QDRANT_PATH))
+        qdrant_client.get_collections()
+        checks["qdrant"] = {"status": "ok", "path": str(DEFAULT_QDRANT_PATH)}
+    except Exception as error:
+        checks["qdrant"] = {"status": "error", "detail": str(error)}
+    finally:
+        if qdrant_client is not None:
+            qdrant_client.close()
+
+    graph_store = None
+    try:
+        graph_store = GraphStore()
+        graph_store.driver.verify_connectivity()
+        checks["neo4j"] = {"status": "ok", "uri": NEO4J_URI}
+    except Exception as error:
+        checks["neo4j"] = {"status": "error", "detail": str(error)}
+    finally:
+        if graph_store is not None:
+            graph_store.close()
+
+    failed = [name for name, check in checks.items() if check["status"] != "ok"]
+    response = {
+        "status": "ok" if not failed else "degraded",
+        "checks": checks,
+        "failed_checks": failed,
+    }
+    if failed:
+        from fastapi.responses import JSONResponse
+
+        return JSONResponse(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, content=response)
+    return response
 
 @app.post("/clone")
 def api_clone(request: CloneRequest):

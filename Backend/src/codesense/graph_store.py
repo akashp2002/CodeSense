@@ -1,11 +1,13 @@
+import os
+
 from neo4j import GraphDatabase
 from typing import List
 from codesense.models.core import CodeChunk, SymbolReference
 
 # Connection constants - can be overridden via env vars
-NEO4J_URI = "bolt://localhost:7687"
-NEO4J_USER = "neo4j"
-NEO4J_PASSWORD = "codesense_password"
+NEO4J_URI = os.getenv("NEO4J_URI", "bolt://localhost:7687")
+NEO4J_USER = os.getenv("NEO4J_USER", "neo4j")
+NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "codesense_password")
 
 class GraphStore:
     def __init__(self, uri: str = NEO4J_URI, user: str = NEO4J_USER, password: str = NEO4J_PASSWORD):
