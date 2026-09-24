@@ -76,7 +76,7 @@ class RefactorAgent:
                 try:
                     result = await agent.ainvoke(
                         {"messages": [("user", prompt)]},
-                        config={"recursion_limit": 8},
+                        config={"recursion_limit": 25},
                     )
                     return result["messages"][-1].content
                 except Exception as inner_e:

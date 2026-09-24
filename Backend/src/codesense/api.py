@@ -247,11 +247,67 @@ def api_index_graph(request: IndexRequest):
         
         graph_store.index_chunks(all_chunks)
         graph_store.index_references(all_refs)
+        graph_store.index_references(all_refs)
         graph_store.close()
         
         return {"symbol_count": len(all_chunks), "relationship_count": len(all_refs)}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+from fastapi import WebSocket, WebSocketDisconnect
+import asyncio
+import traceback
+
+@app.websocket("/ws/query")
+async def websocket_query(websocket: WebSocket):
+    await websocket.accept()
+    try:
+        data = await websocket.receive_json()
+        question = data.get("question")
+        if not question:
+            await websocket.send_json({"type": "error", "message": "No question provided"})
+            return
+            
+        agent = get_supervisor()
+        
+        # Send initial status
+        await websocket.send_json({"type": "status", "message": "Analyzing intent..."})
+        
+        # Run agent in thread so we don't block the async event loop
+        # In a production app, we would use agent.astream() to stream LangGraph events,
+        # but running in a thread with a ping prevents the 5-minute timeout.
+        
+        async def run_agent():
+            return await asyncio.to_thread(agent.run, question)
+            
+        agent_task = asyncio.create_task(run_agent())
+        
+        while not agent_task.done():
+            # Send heartbeat to keep connection alive and UI updated
+            await websocket.send_json({"type": "heartbeat", "message": "Processing..."})
+            await asyncio.sleep(2)
+            
+        result_state = agent_task.result()
+        
+        if "error" in result_state and result_state["error"]:
+            await websocket.send_json({"type": "error", "message": result_state["error"]})
+        else:
+            await websocket.send_json({
+                "type": "result",
+                "answer": result_state.get("final_answer", "No answer generated."),
+                "requires_approval": result_state.get("requires_approval", False),
+                "diff_data": result_state.get("diff_data")
+            })
+            
+    except WebSocketDisconnect:
+        pass
+    except Exception as e:
+        print(f"WS Error: {e}")
+        traceback.print_exc()
+        try:
+            await websocket.send_json({"type": "error", "message": str(e)})
+        except:
+            pass
 
 @app.get("/search")
 def api_search(q: str, limit: int = 5):
