@@ -39,6 +39,25 @@ class VectorStore:
         except Exception:
             pass
         self._ensure_collection()
+
+    def delete_file_chunks(self, file_path: str):
+        """Delete all chunks belonging to a specific file for incremental updates."""
+        try:
+            self.client.delete(
+                collection_name=self.collection_name,
+                points_selector=models.FilterSelector(
+                    filter=models.Filter(
+                        must=[
+                            models.FieldCondition(
+                                key="file_path",
+                                match=models.MatchValue(value=file_path)
+                            )
+                        ]
+                    )
+                )
+            )
+        except Exception as e:
+            print(f"Error deleting chunks for {file_path}: {e}")
             
     def index_chunks(self, chunks: List[CodeChunk]):
         if not chunks:

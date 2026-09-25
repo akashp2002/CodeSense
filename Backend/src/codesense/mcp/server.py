@@ -225,7 +225,8 @@ def search_file(query: str, path: str = "") -> str:
             if ".venv" in root or "__pycache__" in root or ".git" in root:
                 continue
             for file in files:
-                if not file.endswith(".py"):
+                supported = {'.py', '.js', '.jsx', '.ts', '.tsx', '.go', '.rs', '.java'}
+                if not any(file.endswith(ext) for ext in supported):
                     continue
                 file_path = os.path.join(root, file)
                 try:

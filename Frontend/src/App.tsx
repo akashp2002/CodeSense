@@ -28,7 +28,7 @@ function App() {
   const handleClone = async () => {
     if (!repoUrl) return;
     setIsCloning(true);
-    setMessages(prev => [...prev, { id: Date.now().toString(), role: 'system', content: `Cloning repository: ${repoUrl}...` }]);
+    setMessages(prev => [...prev, { id: Date.now().toString(), role: 'system', content: `Cloning repository...` }]);
     
     try {
       const response = await fetch('http://localhost:8001/clone', {
@@ -55,7 +55,6 @@ function App() {
     if (!repoUrl) return;
     setIsDeleting(true);
     
-    // Extract repo name from URL
     const repoName = repoUrl.split('/').pop()?.replace('.git', '') || '';
     const repoPath = `repos/${repoName}`;
     
@@ -89,11 +88,9 @@ function App() {
     setQuery('');
     setIsLoading(true);
     
-    // Create a temporary system message to show status updates
     const statusMsgId = (Date.now() + 1).toString();
-    setMessages(prev => [...prev, { id: statusMsgId, role: 'system', content: 'Connecting to agent...' }]);
+    setMessages(prev => [...prev, { id: statusMsgId, role: 'system', content: 'Connecting to agent workflow...' }]);
     
-    // Connect to WebSocket
     const ws = new WebSocket('ws://localhost:8001/ws/query');
     
     ws.onopen = () => {
@@ -108,7 +105,6 @@ function App() {
           msg.id === statusMsgId ? { ...msg, content: data.message } : msg
         ));
       } else if (data.type === 'result') {
-        // Remove status message and add final result
         setMessages(prev => prev.filter(msg => msg.id !== statusMsgId));
         setMessages(prev => [...prev, { 
           id: (Date.now() + 2).toString(), 
@@ -137,7 +133,6 @@ function App() {
     setMessages(prev => [...prev, { id: Date.now().toString(), role: 'system', content: `Pushing changes and creating PR...` }]);
     
     try {
-      // In a real app, you'd extract the repo name properly
       const repoName = repoUrl.split('/').pop() || 'demo';
       
       const response = await fetch('http://localhost:8001/create-pr', {
@@ -160,48 +155,58 @@ function App() {
 
   return (
     <div className="app-container">
-      <header>
-        <h1>CodeSense</h1>
-        <p style={{ color: 'var(--text-secondary)' }}>AI Agent for Codebase QA & Impact Analysis</p>
-      </header>
+      {/* Sidebar Layout */}
+      <aside className="sidebar glass-panel">
+        <header>
+          <h1>CodeSense</h1>
+          <p style={{ color: 'var(--text-secondary)', fontSize: '0.9rem', lineHeight: '1.4' }}>
+            AI Agent for Codebase QA & Impact Analysis
+          </p>
+        </header>
 
-      <section className="panel">
-        <h3 style={{ marginBottom: '1rem', color: 'var(--text-secondary)', fontSize: '0.875rem', textTransform: 'uppercase', letterSpacing: '0.05em' }}>
-          Repository Configuration
-        </h3>
-        <div className="clone-section">
-          <input 
-            type="text" 
-            value={repoUrl} 
-            onChange={(e) => setRepoUrl(e.target.value)}
-            placeholder="Enter GitHub Repository URL"
-            disabled={isCloning}
-          />
-          <button className="primary" onClick={handleClone} disabled={isCloning || isDeleting}>
-            {isCloning ? 'Cloning...' : 'Clone & Index'}
-          </button>
-          <button className="danger" onClick={handleDeleteRepo} disabled={isCloning || isDeleting || !repoUrl}>
-            {isDeleting ? 'Removing...' : 'Delete Repo'}
-          </button>
+        <div className="config-section">
+          <h3>Repository Configuration</h3>
+          <div className="input-group">
+            <input 
+              type="text" 
+              value={repoUrl} 
+              onChange={(e) => setRepoUrl(e.target.value)}
+              placeholder="GitHub URL (e.g. user/repo)"
+              disabled={isCloning}
+            />
+            <div className="button-row">
+              <button className="primary" onClick={handleClone} disabled={isCloning || isDeleting}>
+                {isCloning ? 'Cloning...' : 'Clone'}
+              </button>
+              <button className="danger" onClick={handleDeleteRepo} disabled={isCloning || isDeleting || !repoUrl}>
+                {isDeleting ? 'Removing...' : 'Delete'}
+              </button>
+            </div>
+          </div>
         </div>
-      </section>
+      </aside>
 
-      <section className="panel chat-container">
+      {/* Main Chat Area */}
+      <main className="chat-area glass-panel">
         <div className="messages">
           {messages.length === 0 ? (
-            <div style={{ textAlign: 'center', color: 'var(--text-secondary)', marginTop: '2rem' }}>
-              No messages yet. Try cloning a repository and asking a question!
+            <div style={{ textAlign: 'center', color: 'var(--text-secondary)', margin: 'auto' }}>
+              <div style={{ fontSize: '3rem', marginBottom: '1rem', opacity: 0.5 }}>⚡</div>
+              <p>No messages yet.</p>
+              <p style={{ fontSize: '0.9rem' }}>Try cloning a repository and asking a question!</p>
             </div>
           ) : (
             messages.map((msg) => (
-              <div key={msg.id} className={`message ${msg.role} ${msg.role === 'system' && isLoading && msg === messages[messages.length-1] ? 'pulse' : ''}`}>
-                <div>{msg.content}</div>
+              <div key={msg.id} className={`message-wrapper ${msg.role}`}>
+                <div className={`message ${msg.role === 'system' && isLoading && msg === messages[messages.length-1] ? 'pulse' : ''}`}>
+                  {msg.content}
+                </div>
                 {msg.diff && (
                   <div className="diff-container">
                     <div className="diff-block">{msg.diff}</div>
                     <div className="diff-actions">
-                      <button className="approve" onClick={() => handleApprovePR("Apply approved refactor")}>Approve & Create PR</button>
-                      <button className="reject" onClick={() => setMessages(prev => [...prev, { id: Date.now().toString(), role: 'system', content: '❌ Refactor rejected.' }])}>Reject</button>
+                      <button className="primary approve" onClick={() => handleApprovePR("Apply approved refactor")}>Approve & Create PR</button>
+                      <button className="danger" onClick={() => setMessages(prev => [...prev, { id: Date.now().toString(), role: 'system', content: '❌ Refactor rejected.' }])}>Reject</button>
                     </div>
                   </div>
                 )}
@@ -211,7 +216,7 @@ function App() {
           <div ref={messagesEndRef} />
         </div>
         
-        <div className="clone-section" style={{ marginTop: 'auto' }}>
+        <div className="input-area">
           <input 
             type="text" 
             value={query} 
@@ -221,10 +226,10 @@ function App() {
             disabled={isLoading}
           />
           <button className="primary" onClick={handleQuery} disabled={isLoading || !query.trim()}>
-            {isLoading ? 'Processing...' : 'Send'}
+            {isLoading ? 'Processing' : 'Send'}
           </button>
         </div>
-      </section>
+      </main>
     </div>
   );
 }

@@ -9,11 +9,12 @@ from codesense.graph_store import GraphStore
 from codesense.agents.semantic_search import SemanticSearchAgent
 from codesense.agents.dependency_graph import DependencyGraphAgent
 
-SKIP_DIRS = {".venv", "__pycache__", "tests", ".git", ".qdrant_db"}
+SKIP_DIRS = {".venv", "__pycache__", "tests", ".git", ".qdrant_db", "node_modules", "dist", "build", "target"}
+SUPPORTED_EXTENSIONS = {".py", ".js", ".jsx", ".ts", ".tsx", ".go", ".rs", ".java"}
 
-def _iter_py_files(path: Path):
-    for file_path in path.rglob("*.py"):
-        if not any(part in SKIP_DIRS for part in file_path.parts):
+def _iter_source_files(path: Path):
+    for file_path in path.rglob("*"):
+        if file_path.suffix.lower() in SUPPORTED_EXTENSIONS and not any(part in SKIP_DIRS for part in file_path.parts):
             yield file_path
 
 def index_repo(repo_path: str):
@@ -28,7 +29,7 @@ def index_repo(repo_path: str):
     
     print(f"--- Indexing repository {repo_path} ---")
     all_chunks = []
-    for file_path in _iter_py_files(path):
+    for file_path in _iter_source_files(path):
         try:
             tree, code = parser.parse_file(str(file_path))
             chunks = chunker.chunk_node(tree.root_node, code, str(file_path))
@@ -60,7 +61,7 @@ def graph_index_repo(repo_path: str):
     
     all_chunks = []
     all_refs = []
-    for file_path in _iter_py_files(path):
+    for file_path in _iter_source_files(path):
         try:
             tree, code = parser.parse_file(str(file_path))
             chunks = chunker.chunk_node(tree.root_node, code, str(file_path))
@@ -83,6 +84,82 @@ def refresh_indexes(repo_path: str):
     """Rebuild both indexes from the repository's current working tree."""
     index_repo(repo_path)
     graph_index_repo(repo_path)
+
+
+def incremental_refresh_indexes(repo_path: str, vector_store=None, graph_store=None) -> str:
+    """Only re-index files that were changed by the last refactor (via git diff).
+    Returns a status message.
+    """
+    import subprocess
+
+    path = Path(repo_path)
+    result = subprocess.run(
+        ["git", "--no-pager", "diff", "--name-only"],
+        cwd=str(path),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    changed_files = [
+        f.strip() for f in result.stdout.strip().splitlines()
+        if any(f.strip().endswith(ext) for ext in SUPPORTED_EXTENSIONS)
+    ]
+
+    if not changed_files:
+        return "No changed source files detected. Indexes are up to date."
+
+    parser_ = CodeParser()
+    chunker = SemanticChunker()
+    extractor = SymbolExtractor()
+    
+    close_vector = False
+    if vector_store is None:
+        vector_store = VectorStore()
+        close_vector = True
+        
+    close_graph = False
+    if graph_store is None:
+        graph_store = GraphStore()
+        close_graph = True
+
+    total_chunks = 0
+    total_refs = 0
+
+    for rel_file in changed_files:
+        file_path = path / rel_file
+        abs_path = str(file_path)
+
+        # Delete old data for this file from both stores
+        vector_store.delete_file_chunks(abs_path)
+        graph_store.delete_file_nodes(abs_path)
+
+        if not file_path.exists():
+            # File was deleted by the refactor
+            print(f"  Removed index entries for deleted file: {rel_file}")
+            continue
+
+        try:
+            tree, code = parser_.parse_file(abs_path)
+            chunks = chunker.chunk_node(tree.root_node, code, abs_path)
+            refs = extractor.extract_references(tree.root_node, code, abs_path)
+            vector_store.index_chunks(chunks)
+            graph_store.index_chunks(chunks)
+            graph_store.index_references(refs)
+            total_chunks += len(chunks)
+            total_refs += len(refs)
+            print(f"  Re-indexed {rel_file}: {len(chunks)} chunks, {len(refs)} refs")
+        except Exception as e:
+            print(f"  Error re-indexing {rel_file}: {e}")
+
+    if close_vector:
+        vector_store.client.close()
+    if close_graph:
+        graph_store.close()
+
+    return (
+        f"Incrementally re-indexed {len(changed_files)} file(s): "
+        f"{total_chunks} chunks, {total_refs} references updated."
+    )
 
 def search_repo(query: str):
     agent = SemanticSearchAgent()

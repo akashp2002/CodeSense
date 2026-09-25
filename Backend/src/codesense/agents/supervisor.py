@@ -152,16 +152,19 @@ class SupervisorAgent:
         return extracted_symbol or question.split()[0]
 
     def _run_refactor(self, state: CodeSenseState) -> CodeSenseState:
-        """Node: Refactor Specialist (MCP)"""
+        """Node: Refactor Specialist (MCP)
+        
+        NOTE: Indexes are NOT refreshed here. They are deferred until the user
+        approves the changes via the /create-pr endpoint, where we do an
+        incremental refresh of only the changed files.
+        """
         print(f"Refactor Agent: Processing request '{state['question']}'")
         try:
             diff_result = self.refactor_agent.run_sync(state["question"], phase="refactor")
-            index_status = self._refresh_indexes()
             state["diff_data"] = diff_result
             state["requires_approval"] = True
             state["final_answer"] = (
-                "I have drafted the refactor. Please review the diff below and approve to create a PR.\n\n"
-                f"{index_status}"
+                "I have drafted the refactor. Please review the diff below and approve to create a PR."
             )
         except TimeoutError as error:
             # The agent may have completed the edit before its final response timed out.
@@ -180,12 +183,11 @@ class SupervisorAgent:
                 diff_result = ""
 
             if diff_result:
-                index_status = self._refresh_indexes()
                 state["diff_data"] = diff_result
                 state["requires_approval"] = True
                 state["final_answer"] = (
                     "The refactor was applied, but the agent timed out while preparing its response. "
-                    f"Please review the recovered diff below.\n\n{index_status}"
+                    "Please review the recovered diff below."
                 )
             else:
                 state["error"] = str(error)

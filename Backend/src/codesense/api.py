@@ -270,26 +270,59 @@ async def websocket_query(websocket: WebSocket):
             
         agent = get_supervisor()
         
-        # Send initial status
-        await websocket.send_json({"type": "status", "message": "Analyzing intent..."})
+        await websocket.send_json({"type": "status", "message": "Starting agent workflow..."})
         
-        # Run agent in thread so we don't block the async event loop
-        # In a production app, we would use agent.astream() to stream LangGraph events,
-        # but running in a thread with a ping prevents the 5-minute timeout.
+        from codesense.models.state import CodeSenseState
+        initial_state = CodeSenseState(
+            question=question,
+            intent=None,
+            search_results=None,
+            impact_results=None,
+            final_answer=None,
+            error=None,
+            requires_approval=False,
+            diff_data=None
+        )
         
-        async def run_agent():
-            return await asyncio.to_thread(agent.run, question)
+        # We run the graph stream in a thread so it doesn't block asyncio
+        def run_stream():
+            final_state = initial_state
+            for chunk in agent.graph.stream(initial_state):
+                for node_name, node_state in chunk.items():
+                    final_state = node_state
+                    # Use a threadsafe queue or asyncio.run_coroutine_threadsafe in real prod
+                    # But since this is just yield, we can't await easily inside thread.
+                    pass
+            return final_state
+
+        loop = asyncio.get_running_loop()
+        
+        async def async_stream():
+            # LangGraph actually has astream!
+            final_state = initial_state
+            try:
+                async for chunk in agent.graph.astream(initial_state):
+                    for node_name, node_state in chunk.items():
+                        final_state = node_state
+                        
+                        # Map node names to friendly messages
+                        msg_map = {
+                            "supervisor": "Classifying your intent...",
+                            "semantic_search": "Searching codebase for relevant context...",
+                            "dependency_graph": "Traversing dependency graph to find impact...",
+                            "explainer": "Drafting final response...",
+                            "refactor_node": "Refactoring code using AST resolution..."
+                        }
+                        friendly_msg = msg_map.get(node_name, f"Running {node_name}...")
+                        
+                        await websocket.send_json({"type": "status", "message": friendly_msg})
+            except Exception as inner_e:
+                final_state["error"] = str(inner_e)
+            return final_state
             
-        agent_task = asyncio.create_task(run_agent())
+        result_state = await async_stream()
         
-        while not agent_task.done():
-            # Send heartbeat to keep connection alive and UI updated
-            await websocket.send_json({"type": "heartbeat", "message": "Processing..."})
-            await asyncio.sleep(2)
-            
-        result_state = agent_task.result()
-        
-        if "error" in result_state and result_state["error"]:
+        if result_state.get("error"):
             await websocket.send_json({"type": "error", "message": result_state["error"]})
         else:
             await websocket.send_json({
@@ -356,14 +389,34 @@ def api_query(request: QueryRequest):
 
 @app.post("/create-pr")
 def api_create_pr(request: CreatePRRequest):
-    """Resume the refactor flow to push the PR after human approval."""
+    """Resume the refactor flow to push the PR after human approval.
+    
+    This is where incremental indexing happens — only after the user
+    explicitly approves the changes, and only for the files that changed.
+    """
     try:
         repo_path = os.getenv("CODESENSE_REPO_PATH")
         if not repo_path:
             repo_path = str(Path("repos") / request.repo_name)
 
+        agent = get_supervisor()
+        
+        # Step 1: Incrementally refresh indexes using the existing connections!
+        from codesense.cli import incremental_refresh_indexes
+        index_status = incremental_refresh_indexes(
+            repo_path,
+            vector_store=agent.search_agent.vector_store,
+            graph_store=agent.graph_agent.graph_store
+        )
+        print(f"Index refresh on approval: {index_status}")
+
+        # Step 2: Create the PR
         pull_request_url = create_pull_request(repo_path, request.prompt)
-        return {"status": "success", "message": f"Pull Request created: {pull_request_url}"}
+        return {
+            "status": "success",
+            "message": f"Pull Request created: {pull_request_url}",
+            "index_status": index_status,
+        }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Could not create Pull Request: {e}") from e
 

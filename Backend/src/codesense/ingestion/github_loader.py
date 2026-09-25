@@ -75,13 +75,14 @@ def clone_repository(github_url: str) -> dict:
         print(f"Cloning {github_url} into {local_path}...")
         Repo.clone_from(github_url, str(local_path), depth=1)
     
-    # Count Python files
-    py_files = list(local_path.rglob("*.py"))
+    # Count all supported source files
+    supported_exts = {'.py', '.js', '.jsx', '.ts', '.tsx', '.go', '.rs', '.java'}
+    source_files = [f for f in local_path.rglob("*") if f.suffix.lower() in supported_exts]
     
     return {
         "repo_name": repo_name,
         "local_path": str(local_path),
-        "file_count": len(py_files),
+        "file_count": len(source_files),
     }
 
 
@@ -104,7 +105,7 @@ def create_pull_request(local_path: str, prompt: str) -> str:
         raise RuntimeError("GITHUB_TOKEN environment variable is not set.")
 
     repo = Repo(local_path)
-    if not repo.is_dirty(untracked_files=True):
+    if not repo.is_dirty(untracked_files=True) and not repo.active_branch.name.startswith("codesense/refactor-"):
         raise RuntimeError("There are no approved changes to commit.")
 
     remote_url = repo.remotes.origin.url.strip().rstrip("/")
@@ -116,16 +117,23 @@ def create_pull_request(local_path: str, prompt: str) -> str:
     else:
         raise RuntimeError(f"Could not determine GitHub repository from remote: {remote_url}")
 
-    base_branch = repo.active_branch.name
-    branch_name = f"codesense/refactor-{uuid.uuid4().hex[:8]}"
-    repo.git.checkout("-b", branch_name)
-
-    repo.git.add(A=True)
-    repo.index.commit(f"Refactor: {prompt[:60]}")
-    repo.git.push("--set-upstream", "origin", branch_name)
-
     github = Github(auth=Auth.Token(token))
     github_repo = github.get_repo(github_repo_name)
+    base_branch = github_repo.default_branch
+
+    current_branch = repo.active_branch.name
+    if current_branch.startswith("codesense/refactor-"):
+        branch_name = current_branch
+    else:
+        branch_name = f"codesense/refactor-{uuid.uuid4().hex[:8]}"
+        repo.git.checkout("-b", branch_name)
+
+    if repo.is_dirty(untracked_files=True):
+        repo.git.add(A=True)
+        repo.index.commit(f"Refactor: {prompt[:60]}")
+    
+    repo.git.push("--set-upstream", "origin", branch_name)
+
     pull_request = github_repo.create_pull(
         title=f"Refactor: {prompt[:80]}",
         body=f"Automated refactor requested through CodeSense:\n\n{prompt}",

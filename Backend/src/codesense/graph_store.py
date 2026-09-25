@@ -21,6 +21,20 @@ class GraphStore:
         with self.driver.session() as session:
             session.run("MATCH (n) DETACH DELETE n")
 
+    def delete_file_nodes(self, file_path: str):
+        """Delete all nodes associated with a specific file to support incremental updates.
+        Also deletes File nodes that match the path, and any edges connected to them.
+        """
+        with self.driver.session() as session:
+            session.run(
+                """
+                MATCH (n)
+                WHERE (n:Symbol AND n.file_path = $file_path) OR (n:File AND n.path = $file_path)
+                DETACH DELETE n
+                """,
+                file_path=file_path
+            )
+
     def index_chunks(self, chunks: List[CodeChunk]):
         """Create nodes for each code symbol."""
         with self.driver.session() as session:
