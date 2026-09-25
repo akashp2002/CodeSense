@@ -3,7 +3,7 @@ import os
 import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
-from langchain_groq import ChatGroq
+from codesense.llm_manager import get_llm
 from langgraph.prebuilt import create_react_agent
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
@@ -18,7 +18,7 @@ class RefactorAgent:
     """
 
     def __init__(self, model_name: str = "qwen/qwen3.8-27b"):
-        self.llm = ChatGroq(model_name=model_name, temperature=0, max_tokens=512)
+        self.llm = get_llm(purpose="coding", temperature=0, max_tokens=512)
         self.timeout_seconds = 120
 
     async def run(self, prompt: str, phase: str = "refactor") -> str:

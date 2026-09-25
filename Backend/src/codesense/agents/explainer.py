@@ -1,11 +1,11 @@
 import json
-from langchain_groq import ChatGroq
+from codesense.llm_manager import get_llm
 from langchain_core.prompts import PromptTemplate
 from codesense.models.state import CodeSenseState
 
 class ExplainerAgent:
     def __init__(self, model_name: str = "openai/gpt-oss-20b"):
-        self.llm = ChatGroq(model_name=model_name, temperature=0)
+        self.llm = get_llm(purpose="fast", temperature=0)
         self.prompt = PromptTemplate(
             template="""You are an expert software engineer analyzing a codebase.
             

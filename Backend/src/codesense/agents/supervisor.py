@@ -4,7 +4,7 @@ import subprocess
 from pathlib import Path
 from typing import Literal
 from pydantic import BaseModel, Field
-from langchain_groq import ChatGroq
+from codesense.llm_manager import get_llm
 from langgraph.graph import StateGraph, START, END
 from codesense.models.state import CodeSenseState
 from codesense.agents.semantic_search import SemanticSearchAgent
@@ -26,8 +26,8 @@ class IntentClassification(BaseModel):
 
 class SupervisorAgent:
     def __init__(self, model_name: str = "qwen/qwen3.8-27b"):
-        self.llm = ChatGroq(
-            model_name=model_name,
+        self.llm = get_llm(
+            purpose="fast",
             temperature=0,
             max_tokens=128,
         ).with_structured_output(IntentClassification)
