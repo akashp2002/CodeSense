@@ -3,6 +3,7 @@ from pathlib import Path
 from qdrant_client import QdrantClient
 from qdrant_client.http import models
 from sentence_transformers import SentenceTransformer
+from fastembed import SparseTextEmbedding
 from codesense.models.core import CodeChunk
 from typing import List
 
@@ -16,20 +17,32 @@ class VectorStore:
         self.collection_name = collection_name
         # Using a fast, lightweight local embedding model
         self.model = SentenceTransformer("all-MiniLM-L6-v2")
+        self.sparse_model = SparseTextEmbedding("Qdrant/bm25")
         
         self._ensure_collection()
 
     def _ensure_collection(self):
         try:
-            self.client.get_collection(self.collection_name)
+            info = self.client.get_collection(self.collection_name)
+            # Check if schema has named vectors (hybrid). If not, wipe and recreate.
+            vectors_config = info.config.params.vectors
+            if not isinstance(vectors_config, dict) or "dense" not in vectors_config:
+                print(f"[VectorStore] Migrating collection to hybrid schema...")
+                self.client.delete_collection(self.collection_name)
+                raise Exception("Recreate needed")
         except Exception:
-            # Collection does not exist
+            # Collection does not exist or needs migration
             self.client.create_collection(
                 collection_name=self.collection_name,
-                vectors_config=models.VectorParams(
-                    size=self.model.get_embedding_dimension(),
-                    distance=models.Distance.COSINE
-                )
+                vectors_config={
+                    "dense": models.VectorParams(
+                        size=self.model.get_embedding_dimension(),
+                        distance=models.Distance.COSINE
+                    )
+                },
+                sparse_vectors_config={
+                    "bm25": models.SparseVectorParams(modifier=models.Modifier.IDF)
+                }
             )
 
     def clear_collection(self):
@@ -79,22 +92,49 @@ class VectorStore:
             ids.append(abs(hash(chunk.file_path + str(chunk.line_range.start_line) + chunk.symbol_name)) % (10 ** 12))
             
         embeddings = self.model.encode(texts)
+        sparse_embeddings = list(self.sparse_model.embed(texts))
+        
+        vectors = {
+            "dense": embeddings.tolist(),
+            "bm25": [
+                models.SparseVector(
+                    indices=sparse.indices.tolist(),
+                    values=sparse.values.tolist()
+                ) for sparse in sparse_embeddings
+            ]
+        }
         
         self.client.upsert(
             collection_name=self.collection_name,
             points=models.Batch(
                 ids=ids,
-                vectors=embeddings.tolist(),
+                vectors=vectors,
                 payloads=payloads
             )
         )
         
     def search(self, query: str, limit: int = 5) -> List[CodeChunk]:
-        query_vector = self.model.encode(query).tolist()
+        query_dense = self.model.encode(query).tolist()
+        query_sparse = next(self.sparse_model.embed([query]))
         
         results = self.client.query_points(
             collection_name=self.collection_name,
-            query=query_vector,
+            prefetch=[
+                models.Prefetch(
+                    query=query_dense,
+                    using="dense",
+                    limit=limit,
+                ),
+                models.Prefetch(
+                    query=models.SparseVector(
+                        indices=query_sparse.indices.tolist(),
+                        values=query_sparse.values.tolist(),
+                    ),
+                    using="bm25",
+                    limit=limit,
+                ),
+            ],
+            query=models.FusionQuery(fusion=models.Fusion.RRF),
             limit=limit
         ).points
         

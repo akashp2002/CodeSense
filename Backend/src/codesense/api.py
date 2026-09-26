@@ -16,6 +16,7 @@ from codesense.ingestion.github_loader import (
     delete_repository,
 )
 from codesense.cli import index_repo, graph_index_repo
+from codesense.ingestion.parser import SUPPORTED_EXTENSIONS
 from codesense.graph_store import GraphStore, NEO4J_URI
 from codesense.vector_store import DEFAULT_QDRANT_PATH
 from qdrant_client import QdrantClient
@@ -162,7 +163,7 @@ def api_index_vectors(request: IndexRequest):
         from codesense.ingestion.chunker import SemanticChunker
         from codesense.vector_store import VectorStore
         
-        SKIP_DIRS = {".venv", "__pycache__", "tests", ".git", ".qdrant_db", "node_modules", ".tox"}
+        SKIP_DIRS = {".venv", "__pycache__", "tests", ".git", ".qdrant_db", "node_modules", ".tox", "dist", "build", "target"}
         
         path = Path(request.repo_path)
         
@@ -173,7 +174,9 @@ def api_index_vectors(request: IndexRequest):
         
         all_chunks = []
         parse_errors = []
-        for file_path in path.rglob("*.py"):
+        for file_path in path.rglob("*"):
+            if file_path.suffix.lower() not in SUPPORTED_EXTENSIONS:
+                continue
             # Use relative path so we only skip dirs INSIDE the repo, not parent dirs
             rel_parts = file_path.relative_to(path).parts
             if any(part in SKIP_DIRS for part in rel_parts):
@@ -220,7 +223,7 @@ def api_index_graph(request: IndexRequest):
         from codesense.ingestion.symbol_table import SymbolExtractor
         from codesense.graph_store import GraphStore
         
-        SKIP_DIRS = {".venv", "__pycache__", "tests", ".git", ".qdrant_db", "node_modules", ".tox"}
+        SKIP_DIRS = {".venv", "__pycache__", "tests", ".git", ".qdrant_db", "node_modules", ".tox", "dist", "build", "target"}
         
         path = Path(request.repo_path)
         parser = CodeParser()
@@ -232,7 +235,9 @@ def api_index_graph(request: IndexRequest):
         
         all_chunks = []
         all_refs = []
-        for file_path in path.rglob("*.py"):
+        for file_path in path.rglob("*"):
+            if file_path.suffix.lower() not in SUPPORTED_EXTENSIONS:
+                continue
             rel_parts = file_path.relative_to(path).parts
             if any(part in SKIP_DIRS for part in rel_parts):
                 continue
@@ -246,7 +251,6 @@ def api_index_graph(request: IndexRequest):
                 pass
         
         graph_store.index_chunks(all_chunks)
-        graph_store.index_references(all_refs)
         graph_store.index_references(all_refs)
         graph_store.close()
         
@@ -389,19 +393,49 @@ def api_query(request: QueryRequest):
 
 @app.post("/create-pr")
 def api_create_pr(request: CreatePRRequest):
-    """Resume the refactor flow to push the PR after human approval.
+    """Resume the refactor flow to push the PR after human approval."""
+    import subprocess
+    import shutil
+    import stat
     
-    This is where incremental indexing happens — only after the user
-    explicitly approves the changes, and only for the files that changed.
-    """
+    def remove_readonly(func, path, excinfo):
+        os.chmod(path, stat.S_IWRITE)
+        try:
+            func(path)
+        except Exception:
+            pass
+    
     try:
         repo_path = os.getenv("CODESENSE_REPO_PATH")
         if not repo_path:
             repo_path = str(Path("repos") / request.repo_name)
 
+        staging_path = repo_path + "_staging"
+        if not os.path.exists(staging_path):
+            raise HTTPException(status_code=400, detail="Staging sandbox not found. Cannot approve.")
+
         agent = get_supervisor()
         
-        # Step 1: Incrementally refresh indexes using the existing connections!
+        # Step 1: Find which files changed in the staging sandbox
+        changed_files = subprocess.run(
+            ["git", "diff", "--name-only"],
+            cwd=staging_path, capture_output=True, text=True
+        ).stdout.strip().splitlines()
+        
+        # Step 2: Copy changed files from staging back to main repo
+        for rel_path in changed_files:
+            if not rel_path:
+                continue
+            src = os.path.join(staging_path, rel_path)
+            dst = os.path.join(repo_path, rel_path)
+            if os.path.exists(src):
+                os.makedirs(os.path.dirname(dst), exist_ok=True)
+                shutil.copy2(src, dst)
+        
+        # Step 3: Create the PR directly from the main repo (it now has the changes)
+        pull_request_url = create_pull_request(repo_path, request.prompt)
+        
+        # Step 4: Incrementally refresh indexes
         from codesense.cli import incremental_refresh_indexes
         index_status = incremental_refresh_indexes(
             repo_path,
@@ -409,9 +443,10 @@ def api_create_pr(request: CreatePRRequest):
             graph_store=agent.graph_agent.graph_store
         )
         print(f"Index refresh on approval: {index_status}")
+        
+        # Clean up sandbox
+        shutil.rmtree(staging_path, onerror=remove_readonly)
 
-        # Step 2: Create the PR
-        pull_request_url = create_pull_request(repo_path, request.prompt)
         return {
             "status": "success",
             "message": f"Pull Request created: {pull_request_url}",

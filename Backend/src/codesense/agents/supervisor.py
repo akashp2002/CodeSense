@@ -152,47 +152,67 @@ class SupervisorAgent:
         return extracted_symbol or question.split()[0]
 
     def _run_refactor(self, state: CodeSenseState) -> CodeSenseState:
-        """Node: Refactor Specialist (MCP)
+        """Node: Refactor Specialist (MCP Sandbox)
         
-        NOTE: Indexes are NOT refreshed here. They are deferred until the user
-        approves the changes via the /create-pr endpoint, where we do an
-        incremental refresh of only the changed files.
+        Creates a virtual staging area so the agent cannot corrupt the live working
+        tree. The diff is generated from the sandbox.
         """
+        import shutil
         print(f"Refactor Agent: Processing request '{state['question']}'")
+        
+        repo_path = os.getenv("CODESENSE_REPO_PATH") or str(Path.cwd() / "repos" / "demo")
+        staging_path = repo_path + "_staging"
+        
+        import stat
+        def remove_readonly(func, path, excinfo):
+            os.chmod(path, stat.S_IWRITE)
+            try:
+                func(path)
+            except Exception:
+                pass
+
+        # 1. Create the virtual staging area
+        if os.path.exists(staging_path):
+            shutil.rmtree(staging_path, onerror=remove_readonly)
+        shutil.copytree(repo_path, staging_path)
+        
+        original_env_path = os.getenv("CODESENSE_REPO_PATH")
+        os.environ["CODESENSE_REPO_PATH"] = staging_path
+        
         try:
             diff_result = self.refactor_agent.run_sync(state["question"], phase="refactor")
             state["diff_data"] = diff_result
             state["requires_approval"] = True
             state["final_answer"] = (
-                "I have drafted the refactor. Please review the diff below and approve to create a PR."
+                "I have drafted the refactor in a secure sandbox. Please review the diff below and approve to create a PR."
             )
         except TimeoutError as error:
-            # The agent may have completed the edit before its final response timed out.
-            repo_path = os.getenv("CODESENSE_REPO_PATH") or str(
-                Path.cwd() / "repos" / "demo"
-            )
-            if repo_path:
-                diff_result = subprocess.run(
-                    ["git", "--no-pager", "diff"],
-                    cwd=repo_path,
-                    capture_output=True,
-                    text=True,
-                    check=False,
-                ).stdout.strip()
-            else:
-                diff_result = ""
+            # Fallback if the agent timed out but made edits
+            diff_result = subprocess.run(
+                ["git", "--no-pager", "diff"],
+                cwd=staging_path,
+                capture_output=True,
+                text=True,
+                check=False,
+            ).stdout.strip()
 
             if diff_result:
                 state["diff_data"] = diff_result
                 state["requires_approval"] = True
                 state["final_answer"] = (
-                    "The refactor was applied, but the agent timed out while preparing its response. "
+                    "The refactor was applied to the sandbox, but the agent timed out while preparing its response. "
                     "Please review the recovered diff below."
                 )
             else:
                 state["error"] = str(error)
         except Exception as e:
             state["error"] = f"Refactor failed: {e}"
+        finally:
+            if original_env_path is not None:
+                os.environ["CODESENSE_REPO_PATH"] = original_env_path
+            else:
+                os.environ.pop("CODESENSE_REPO_PATH", None)
+                
         return state
 
     def _refresh_indexes(self) -> str:

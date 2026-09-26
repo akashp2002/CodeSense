@@ -36,35 +36,26 @@ class RefactorAgent:
             async with ClientSession(read, write) as session:
                 await session.initialize()
 
-                tools = await load_mcp_tools(session)
-
+                all_tools = await load_mcp_tools(session)
+                
+                # Filter tools per phase to reduce token usage (Groq free-tier has small context)
                 if phase == "refactor":
+                    allowed = {"search_file", "rename_symbol", "get_git_diff", "read_file", "list_files"}
+                    tools = [t for t in all_tools if t.name in allowed]
                     system_prompt = (
-                        "You are an expert software engineer. You have tools to search files, "
-                        "rename Python symbols with AST resolution, and get git diffs.\n\n"
-                        "INSTRUCTIONS — follow these steps IN ORDER, then STOP:\n"
-                        "1. Use `search_file` to locate the Python file and confirm the symbol.\n"
-                        "2. Use `rename_symbol` with the relative file path, old identifier, and new identifier. "
-                        "This resolves the definition and repository-wide imports/references with Tree-sitter and validates every changed file.\n"
-                        "3. Use `get_git_diff` to verify your changes.\n"
-                        "4. Return the diff as your final answer. DO NOT call any more tools.\n\n"
-                        "CRITICAL RULES:\n"
-                        "- Do NOT use `replace_in_file`, `replace_lines`, or unrestricted text replacement.\n"
-                        "- Only rename valid Python identifiers through `rename_symbol`.\n"
-                        "- Do NOT repeat a tool call with the same arguments. If you already searched, move on.\n"
-                        "- Do NOT use branch, commit, push, or PR tools.\n"
-                        "- STOP after returning the diff or an explanation."
+                        "You are a code refactoring agent. Follow these steps IN ORDER then STOP:\n"
+                        "1. search_file to find the symbol.\n"
+                        "2. rename_symbol with the file path, old name, new name.\n"
+                        "3. get_git_diff to show changes.\n"
+                        "4. Return the diff. STOP.\n"
+                        "Do NOT repeat calls. Do NOT use branch/commit/push tools."
                     )
                 else:
+                    allowed = {"create_branch", "commit_changes", "push_branch", "create_pull_request"}
+                    tools = [t for t in all_tools if t.name in allowed]
                     system_prompt = (
-                        "You are an expert software engineer. You have tools to create branches, "
-                        "commit, push, and create pull requests.\n\n"
-                        "INSTRUCTIONS — follow these steps IN ORDER, then STOP:\n"
-                        "1. Use `create_branch` to create a new branch.\n"
-                        "2. Use `commit_changes` to commit all staged changes.\n"
-                        "3. Use `push_branch` to push the branch.\n"
-                        "4. Use `create_pull_request` to open the PR.\n"
-                        "5. Return the PR URL as your final answer. DO NOT call any more tools."
+                        "Create a PR. Steps: create_branch, commit_changes, push_branch, create_pull_request. "
+                        "Return the PR URL. STOP."
                     )
 
                 agent = create_react_agent(
@@ -76,7 +67,7 @@ class RefactorAgent:
                 try:
                     result = await agent.ainvoke(
                         {"messages": [("user", prompt)]},
-                        config={"recursion_limit": 25},
+                        config={"recursion_limit": 15},
                     )
                     return result["messages"][-1].content
                 except Exception as inner_e:
