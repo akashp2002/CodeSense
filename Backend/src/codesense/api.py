@@ -21,7 +21,77 @@ from codesense.graph_store import GraphStore, NEO4J_URI
 from codesense.vector_store import DEFAULT_QDRANT_PATH
 from qdrant_client import QdrantClient
 
-app = FastAPI(title="CodeSense API", description="AI Agent for Codebase QA & Impact Analysis")
+from contextlib import asynccontextmanager
+
+_LAST_COMMIT_FILE = Path(__file__).resolve().parents[2] / ".last_indexed_commit"
+
+def _startup_sync():
+    """
+    On server start: compare the stored last-indexed git commit with the
+    current HEAD. If they differ, re-index only the changed files.
+    This implements the production flow:
+        Git commit changed? → find changed files → delete old chunks → re-parse → upsert
+    """
+    import subprocess
+    repo_path = os.getenv("CODESENSE_REPO_PATH")
+    if not repo_path:
+        # auto-discover
+        repos_dir = Path(__file__).resolve().parent.parent.parent / "repos"
+        candidates = [p for p in repos_dir.iterdir() if p.is_dir() and not p.name.endswith("_staging")] if repos_dir.exists() else []
+        if candidates:
+            repo_path = str(candidates[0])
+            os.environ["CODESENSE_REPO_PATH"] = repo_path
+
+    if not repo_path or not os.path.exists(repo_path):
+        print("Startup sync: no repository found, skipping.")
+        return
+
+    try:
+        current_head = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=repo_path, capture_output=True, text=True, check=False
+        ).stdout.strip()
+
+        last_indexed = _LAST_COMMIT_FILE.read_text().strip() if _LAST_COMMIT_FILE.exists() else None
+
+        if not current_head:
+            print("Startup sync: could not read git HEAD, skipping.")
+            return
+
+        if last_indexed == current_head:
+            print(f"Startup sync: index is current (commit {current_head[:8]}). Using cache.")
+            return
+
+        # Find files that changed between the last indexed commit and now
+        if last_indexed:
+            diff_result = subprocess.run(
+                ["git", "diff", "--name-only", last_indexed, current_head],
+                cwd=repo_path, capture_output=True, text=True, check=False
+            ).stdout.strip()
+            changed_files = [f for f in diff_result.splitlines() if f.strip()]
+            print(f"Startup sync: {len(changed_files)} files changed since last index (commits {last_indexed[:8]}..{current_head[:8]})")
+        else:
+            changed_files = None  # No prior index — full re-index needed
+            print(f"Startup sync: no prior index found, running full re-index...")
+
+        from codesense.cli import incremental_refresh_indexes, refresh_indexes
+        if changed_files is not None:
+            incremental_refresh_indexes(repo_path, changed_files=changed_files)
+        else:
+            refresh_indexes(repo_path)
+
+        # Save the current HEAD as the new last-indexed commit
+        _LAST_COMMIT_FILE.write_text(current_head)
+        print(f"Startup sync: complete. Indexed up to commit {current_head[:8]}.")
+    except Exception as e:
+        print(f"Startup sync: failed ({e}). Existing index will be used.")
+
+@asynccontextmanager
+async def lifespan(app):
+    _startup_sync()
+    yield
+
+app = FastAPI(title="CodeSense API", description="AI Agent for Codebase QA & Impact Analysis", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -126,10 +196,28 @@ def health_check():
 
 @app.post("/clone")
 def api_clone(request: CloneRequest):
-    """Clone a GitHub repository to the local repos/ directory."""
+    """Clone a GitHub repository to the local repos/ directory and incrementally index changes."""
     try:
         result = clone_repository(request.github_url)
-        os.environ["CODESENSE_REPO_PATH"] = result["local_path"]
+        repo_path = result["local_path"]
+        os.environ["CODESENSE_REPO_PATH"] = repo_path
+        
+        changed_files = result.get("changed_files")
+        if changed_files is not None:
+            if len(changed_files) > 0:
+                print(f"Incremental sync: {len(changed_files)} files changed. Re-indexing...")
+                from codesense.cli import incremental_refresh_indexes
+                agent = get_supervisor()
+                index_msg = incremental_refresh_indexes(
+                    repo_path,
+                    vector_store=agent.search_agent.vector_store,
+                    graph_store=agent.graph_agent.graph_store,
+                    changed_files=changed_files
+                )
+                print(f"Index sync complete: {index_msg}")
+            else:
+                print("Repository is up-to-date. Using cached indexes.")
+                
         return result
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -283,6 +371,7 @@ async def websocket_query(websocket: WebSocket):
             search_results=None,
             impact_results=None,
             final_answer=None,
+            plan=None,
             error=None,
             requires_approval=False,
             diff_data=None
@@ -318,8 +407,8 @@ async def websocket_query(websocket: WebSocket):
                             "refactor_node": "Refactoring code using AST resolution..."
                         }
                         friendly_msg = msg_map.get(node_name, f"Running {node_name}...")
-                        
                         await websocket.send_json({"type": "status", "message": friendly_msg})
+                            
             except Exception as inner_e:
                 final_state["error"] = str(inner_e)
             return final_state
@@ -332,6 +421,7 @@ async def websocket_query(websocket: WebSocket):
             await websocket.send_json({
                 "type": "result",
                 "answer": result_state.get("final_answer", "No answer generated."),
+                "plan": result_state.get("plan"),
                 "requires_approval": result_state.get("requires_approval", False),
                 "diff_data": result_state.get("diff_data")
             })
@@ -421,11 +511,10 @@ def api_create_pr(request: CreatePRRequest):
             ["git", "diff", "--name-only"],
             cwd=staging_path, capture_output=True, text=True
         ).stdout.strip().splitlines()
+        changed_files = [f for f in changed_files if f.strip()]
         
         # Step 2: Copy changed files from staging back to main repo
         for rel_path in changed_files:
-            if not rel_path:
-                continue
             src = os.path.join(staging_path, rel_path)
             dst = os.path.join(repo_path, rel_path)
             if os.path.exists(src):
@@ -435,17 +524,29 @@ def api_create_pr(request: CreatePRRequest):
         # Step 3: Create the PR directly from the main repo (it now has the changes)
         pull_request_url = create_pull_request(repo_path, request.prompt)
         
-        # Step 4: Incrementally refresh indexes
+        # Step 4: Incrementally refresh indexes using the KNOWN changed files
+        # (must pass explicitly because git diff returns empty after commit)
         from codesense.cli import incremental_refresh_indexes
         index_status = incremental_refresh_indexes(
             repo_path,
             vector_store=agent.search_agent.vector_store,
-            graph_store=agent.graph_agent.graph_store
+            graph_store=agent.graph_agent.graph_store,
+            changed_files=changed_files
         )
         print(f"Index refresh on approval: {index_status}")
         
         # Clean up sandbox
         shutil.rmtree(staging_path, onerror=remove_readonly)
+        
+        # Update the last-indexed commit so startup sync skips next time
+        try:
+            import subprocess as _sp
+            new_head = _sp.run(["git", "rev-parse", "HEAD"], cwd=repo_path,
+                               capture_output=True, text=True, check=False).stdout.strip()
+            if new_head:
+                _LAST_COMMIT_FILE.write_text(new_head)
+        except Exception:
+            pass
 
         return {
             "status": "success",
@@ -454,6 +555,27 @@ def api_create_pr(request: CreatePRRequest):
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Could not create Pull Request: {e}") from e
+
+@app.post("/reindex")
+def api_reindex():
+    """Force a full re-index of the currently active repository. Use when indexes become stale."""
+    repo_path = os.getenv("CODESENSE_REPO_PATH")
+    if not repo_path:
+        # Fallback: use the first cloned repo found in repos/
+        repos_dir = Path(__file__).resolve().parent.parent.parent / "repos"
+        candidates = [p for p in repos_dir.iterdir() if p.is_dir() and not p.name.endswith("_staging")] if repos_dir.exists() else []
+        if candidates:
+            repo_path = str(candidates[0])
+            os.environ["CODESENSE_REPO_PATH"] = repo_path
+    if not repo_path or not os.path.exists(repo_path):
+        raise HTTPException(status_code=400, detail="No active repository. Clone one first via /clone.")
+    try:
+        reset_supervisor()
+        from codesense.cli import refresh_indexes
+        refresh_indexes(repo_path)
+        return {"status": "ok", "message": f"Re-indexed {repo_path} successfully."}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Re-index failed: {e}")
 
 def start():
     """Entry point for the CLI to start the server."""

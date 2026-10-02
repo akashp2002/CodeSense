@@ -9,6 +9,7 @@ class CodeSenseState(TypedDict):
     search_results: Optional[List[Dict[str, Any]]]
     impact_results: Optional[Dict[str, Any]]
     final_answer: Optional[str]
+    plan: Optional[str]
     error: Optional[str]
     requires_approval: Optional[bool]
     diff_data: Optional[str]

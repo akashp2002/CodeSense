@@ -245,17 +245,43 @@ def search_file(query: str, path: str = "") -> str:
     except Exception as e:
         return f"Error searching: {e}"
 
+def _get_safe_path(repo_path: Path, file_path: str) -> Path:
+    p = Path(file_path)
+    if p.is_absolute():
+        return p.resolve()
+    return (repo_path / p).resolve()
+
 @mcp.tool()
 def read_file(file_path: str) -> str:
     """Read the contents of a file in the repository, with line numbers included."""
     repo_path = get_repo_path()
-    full_path = repo_path / file_path
+    full_path = _get_safe_path(repo_path, file_path)
     try:
         with open(full_path, "r", encoding="utf-8") as f:
             lines = f.readlines()
             return "\n".join(f"{i+1:4d} | {line.rstrip()}" for i, line in enumerate(lines))
     except Exception as e:
         return f"Error reading file: {e}"
+
+@mcp.tool()
+def replace_in_file(file_path: str, search_string: str, replacement_string: str) -> str:
+    """Replace an exact string in a file with a new string.
+    
+    This replaces ALL occurrences of search_string with replacement_string.
+    For line replacements, include the exact whitespace/indentation.
+    """
+    repo_path = get_repo_path()
+    full_path = _get_safe_path(repo_path, file_path)
+    try:
+        content = full_path.read_text(encoding="utf-8")
+        if search_string not in content:
+            return f"Error: '{search_string}' not found in {file_path}."
+        
+        updated_content = content.replace(search_string, replacement_string)
+        full_path.write_text(updated_content, encoding="utf-8")
+        return f"Successfully replaced occurrences in {file_path}."
+    except Exception as e:
+        return f"Error replacing in file: {e}"
 
 @mcp.tool()
 def rename_symbol(file_path: str, old_name: str, new_name: str) -> str:
@@ -266,9 +292,15 @@ def rename_symbol(file_path: str, old_name: str, new_name: str) -> str:
         return "Error: old_name and new_name must be different."
 
     repo_path = get_repo_path()
-    full_path = (repo_path / file_path).resolve()
-    if repo_path not in full_path.parents or full_path.suffix != ".py":
-        return "Error: file_path must be a Python file inside the repository."
+    full_path = _get_safe_path(repo_path, file_path)
+    
+    try:
+        full_path.relative_to(repo_path.resolve())
+    except ValueError:
+        return "Error: file_path must be inside the repository."
+        
+    if full_path.suffix != ".py":
+        return "Error: file_path must be a Python file."
 
     try:
         original = full_path.read_bytes()

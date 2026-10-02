@@ -27,16 +27,25 @@ def _remove_readonly(func, path, _):
 def clone_repository(github_url: str) -> dict:
     """
     Clone a GitHub repository into the local repos/ directory.
-    Returns a dict with repo_name and local_path.
+    Returns a dict with repo_name, local_path, and optionally changed_files.
     """
     repo_name = parse_github_url(github_url)
     local_path = REPOS_DIR / repo_name
+    changed_files = None
 
     # If the repo already exists, update it instead of deleting (which fails due to DB locks)
     if local_path.exists():
         print(f"Repository {repo_name} already exists. Pulling latest changes...")
         try:
             repo = Repo(str(local_path))
+            
+            # Get old commit hash before pulling
+            old_head = None
+            try:
+                old_head = repo.head.commit.hexsha
+            except ValueError:
+                pass # repo is empty or corrupted
+                
             origin = repo.remotes.origin
             origin.fetch()
             # Find default branch from remote refs, usually main or master
@@ -50,6 +59,20 @@ def clone_repository(github_url: str) -> dict:
             repo.git.reset('--hard', f"origin/{default_branch}")
             # Also clean untracked files
             repo.git.clean('-fd')
+            
+            # Get new commit hash after pulling
+            new_head = repo.head.commit.hexsha
+            
+            # Find changed files between old and new
+            if old_head and old_head != new_head:
+                diff = repo.git.diff('--name-only', old_head, new_head)
+                if diff:
+                    changed_files = diff.strip().splitlines()
+                else:
+                    changed_files = []
+            elif not old_head:
+                changed_files = [] # Treat as fresh clone if it was corrupted
+                
         except InvalidGitRepositoryError:
             print(f"Repository {repo_name} is corrupted (likely due to partial deletion). Re-initializing...")
             repo = Repo.init(str(local_path))
@@ -79,15 +102,18 @@ def clone_repository(github_url: str) -> dict:
     supported_exts = {'.py', '.js', '.jsx', '.ts', '.tsx', '.go', '.rs', '.java'}
     source_files = [f for f in local_path.rglob("*") if f.suffix.lower() in supported_exts]
     
-    return {
+    result = {
         "repo_name": repo_name,
         "local_path": str(local_path),
         "file_count": len(source_files),
     }
+    if changed_files is not None:
+        result["changed_files"] = changed_files
+    return result
 
 
 def delete_repository(local_path: str) -> None:
-    """Delete a cloned repository managed by CodeSense."""
+    """Delete a cloned repository and its staging area managed by CodeSense."""
     repos_root = REPOS_DIR.resolve()
     target = Path(local_path).resolve()
 
@@ -96,6 +122,10 @@ def delete_repository(local_path: str) -> None:
 
     if target.exists():
         shutil.rmtree(target, onerror=_remove_readonly)
+        
+    staging_target = Path(str(target) + "_staging")
+    if staging_target.exists():
+        shutil.rmtree(staging_target, onerror=_remove_readonly)
 
 
 def create_pull_request(local_path: str, prompt: str) -> str:

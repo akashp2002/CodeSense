@@ -86,24 +86,24 @@ def refresh_indexes(repo_path: str):
     graph_index_repo(repo_path)
 
 
-def incremental_refresh_indexes(repo_path: str, vector_store=None, graph_store=None) -> str:
-    """Only re-index files that were changed by the last refactor (via git diff).
+def incremental_refresh_indexes(repo_path: str, vector_store=None, graph_store=None, changed_files: list[str] = None) -> str:
+    """Only re-index files that were changed by the last refactor or a git pull.
     Returns a status message.
     """
     import subprocess
-
     path = Path(repo_path)
-    result = subprocess.run(
-        ["git", "--no-pager", "diff", "--name-only"],
-        cwd=str(path),
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    changed_files = [
-        f.strip() for f in result.stdout.strip().splitlines()
-        if any(f.strip().endswith(ext) for ext in SUPPORTED_EXTENSIONS)
-    ]
+
+    if changed_files is None:
+        result = subprocess.run(
+            ["git", "--no-pager", "diff", "--name-only"],
+            cwd=str(path),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        changed_files = [f.strip() for f in result.stdout.strip().splitlines()]
+        
+    changed_files = [f for f in changed_files if any(f.endswith(ext) for ext in SUPPORTED_EXTENSIONS)]
 
     if not changed_files:
         return "No changed source files detected. Indexes are up to date."

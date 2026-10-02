@@ -50,40 +50,46 @@ class SupervisorAgent:
             result = self.llm.invoke(f"Classify the following codebase question: {state['question']}")
             state["intent"] = result.intent
             
-            # Store the extracted symbol temporarily in the state if it's an impact query
             if result.intent == "impact" and result.extracted_symbol:
-                # We reuse the 'question' field for the symbol to pass to the next node
-                # A more robust way is adding it to state, but we'll pack it here for simplicity.
                 state["_target_symbol"] = result.extracted_symbol
             
             print(f"Supervisor: Classified intent as '{state['intent']}'")
         except Exception as e:
-            fallback = self._fallback_intent(state["question"], e)
-            if fallback:
-                state["intent"], state["_target_symbol"] = fallback
-                print(
-                    f"Supervisor: Model classification unavailable; "
-                    f"using fallback intent '{state['intent']}'"
-                )
-            else:
-                state["error"] = f"Failed to classify intent: {e}"
+            # Always try keyword fallback first — handles rate limits AND tool_use_failed
+            intent, symbol = self._fallback_intent(state["question"])
+            state["intent"] = intent
+            if symbol:
+                state["_target_symbol"] = symbol
+            print(
+                f"Supervisor: Structured classification failed ({type(e).__name__}); "
+                f"using keyword fallback intent '{intent}'"
+            )
         return state
 
     @staticmethod
-    def _fallback_intent(question: str, error: Exception):
-        """Keep simple impact questions usable when the classifier is rate-limited."""
-        error_text = str(error).lower()
-        if "429" not in error_text and "rate_limit" not in error_text and "token" not in error_text:
-            return None
-
+    def _fallback_intent(question: str) -> tuple[str, str | None]:
+        """Rule-based intent classifier used when the LLM structured output fails for any reason."""
+        q = question.lower()
         words = re.findall(r"[A-Za-z_][A-Za-z0-9_]*", question)
-        lowered = {word.lower() for word in words}
-        impact_terms = {"impact", "effect", "affect", "depend", "dependencies", "files", "break"}
-        if lowered & impact_terms:
-            symbols = [word for word in words if "_" in word or word[:1].isupper()]
-            symbol = next((word for word in symbols if word.lower() not in {"what", "files"}), None)
-            return "impact", symbol
-        return None
+        
+        # Symbols: snake_case or CamelCase words that aren't common words
+        stopwords = {"what", "where", "how", "does", "is", "it", "the", "a", "an",
+                     "to", "if", "i", "do", "will", "be", "in", "of", "and", "or"}
+        symbol_candidates = [w for w in words if ("_" in w or w[:1].isupper()) and w.lower() not in stopwords]
+        top_symbol = symbol_candidates[0] if symbol_candidates else None
+        
+        refactor_terms = {"rename", "refactor", "replace", "rewrite", "change", "modify", "update", "move"}
+        impact_terms  = {"dependent", "dependant", "depend", "dependencies", "impact", "affect",
+                         "effect", "break", "uses", "callers", "calls", "blast"}
+        search_terms  = {"where", "find", "locate", "which", "file", "defined", "implemented", "show"}
+        
+        if any(t in q for t in refactor_terms):
+            return "refactor", top_symbol
+        if any(t in q for t in impact_terms):
+            return "impact", top_symbol
+        if any(t in q for t in search_terms):
+            return "search", top_symbol
+        return "explain", top_symbol
 
     def _route(self, state: CodeSenseState) -> str:
         """Conditional router based on intent."""
@@ -93,10 +99,10 @@ class SupervisorAgent:
         intent = state.get("intent")
         if intent == "impact":
             return "dependency_graph"
-        elif intent == "search":
+        if intent == "dependency_graph":
+            return "dependency_graph"
+        elif intent == "search" or intent == "refactor":
             return "semantic_search"
-        elif intent == "refactor":
-            return "refactor_node"
         else:
             # Explain usually requires searching first to get context, so we route to search then explain
             return "semantic_search"
@@ -151,19 +157,20 @@ class SupervisorAgent:
             return candidates[0]
         return extracted_symbol or question.split()[0]
 
-    def _run_refactor(self, state: CodeSenseState) -> CodeSenseState:
-        """Node: Refactor Specialist (MCP Sandbox)
+    def _refactor_node(self, state: CodeSenseState) -> CodeSenseState:
+        """Node: Run the refactor agent in a sandbox.
         
-        Creates a virtual staging area so the agent cannot corrupt the live working
-        tree. The diff is generated from the sandbox.
+        Creates a lightweight staging area (skipping .git to avoid slow
+        Windows permission copies) so the agent cannot corrupt the live
+        working tree.  The diff is generated from the sandbox.
         """
         import shutil
+        import stat
         print(f"Refactor Agent: Processing request '{state['question']}'")
         
         repo_path = os.getenv("CODESENSE_REPO_PATH") or str(Path.cwd() / "repos" / "demo")
         staging_path = repo_path + "_staging"
         
-        import stat
         def remove_readonly(func, path, excinfo):
             os.chmod(path, stat.S_IWRITE)
             try:
@@ -171,16 +178,34 @@ class SupervisorAgent:
             except Exception:
                 pass
 
-        # 1. Create the virtual staging area
+        # 1. Create a lightweight staging area (skip .git for speed)
         if os.path.exists(staging_path):
             shutil.rmtree(staging_path, onerror=remove_readonly)
-        shutil.copytree(repo_path, staging_path)
+        shutil.copytree(repo_path, staging_path, ignore=shutil.ignore_patterns('.git'))
+        
+        # Init a fresh git repo so get_git_diff still works
+        subprocess.run(["git", "init"], cwd=staging_path, capture_output=True, check=False)
+        subprocess.run(["git", "add", "."], cwd=staging_path, capture_output=True, check=False)
+        subprocess.run(["git", "commit", "-m", "baseline", "--allow-empty"], cwd=staging_path,
+                        capture_output=True, check=False, env={**os.environ, "GIT_AUTHOR_NAME": "CodeSense",
+                        "GIT_AUTHOR_EMAIL": "bot@codesense", "GIT_COMMITTER_NAME": "CodeSense",
+                        "GIT_COMMITTER_EMAIL": "bot@codesense"})
         
         original_env_path = os.getenv("CODESENSE_REPO_PATH")
         os.environ["CODESENSE_REPO_PATH"] = staging_path
         
+        # Build a context-enriched prompt from semantic search results
+        context = ""
+        if state.get("search_results"):
+            context = "Relevant code from the repository:\n"
+            for res in state["search_results"][:5]:
+                context += f"- File: {res['file_path']} (Lines {res['line_range']})\n"
+                context += f"```\n{res['snippet']}\n```\n\n"
+        
+        prompt = f"{context}\nUser Request: {state['question']}"
+        
         try:
-            diff_result = self.refactor_agent.run_sync(state["question"], phase="refactor")
+            diff_result = self.refactor_agent.run_sync(prompt, phase="refactor")
             state["diff_data"] = diff_result
             state["requires_approval"] = True
             state["final_answer"] = (
@@ -234,7 +259,8 @@ class SupervisorAgent:
             return f"Index refresh failed; search results may be stale: {error}"
 
     def _route_after_search(self, state: CodeSenseState) -> str:
-        """Always route to explainer to synthesize search results into a natural language answer."""
+        if state.get("intent") == "refactor":
+            return "refactor_node"
         return "explainer"
 
     def _build_graph(self):
@@ -245,7 +271,7 @@ class SupervisorAgent:
         workflow.add_node("semantic_search", self._run_semantic_search)
         workflow.add_node("dependency_graph", self._run_dependency_graph)
         workflow.add_node("explainer", self.explainer_agent.generate_explanation)
-        workflow.add_node("refactor_node", self._run_refactor)
+        workflow.add_node("refactor_node", self._refactor_node)
 
         # Edges
         workflow.add_edge(START, "supervisor")
@@ -257,17 +283,17 @@ class SupervisorAgent:
             {
                 "semantic_search": "semantic_search",
                 "dependency_graph": "dependency_graph",
-                "refactor_node": "refactor_node",
                 END: END
             }
         )
         
-        # After search, either END (if intent was just search) or go to explainer (if intent was explain)
+        # After search, route to explainer or refactor based on intent
         workflow.add_conditional_edges(
             "semantic_search",
             self._route_after_search,
             {
                 "explainer": "explainer",
+                "refactor_node": "refactor_node",
                 END: END
             }
         )
@@ -275,7 +301,7 @@ class SupervisorAgent:
         # After dependency graph, always go to explainer to synthesize
         workflow.add_edge("dependency_graph", "explainer")
         
-        # After refactor, we pause for UI approval
+        # After refactor, we're done (UI shows approval)
         workflow.add_edge("refactor_node", END)
         
         # After explainer, we're done
@@ -294,6 +320,7 @@ class SupervisorAgent:
             search_results=None,
             impact_results=None,
             final_answer=None,
+            plan=None,
             error=None,
             requires_approval=False,
             diff_data=None
