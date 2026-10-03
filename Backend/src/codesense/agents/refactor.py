@@ -40,23 +40,18 @@ class RefactorAgent:
                 
                 # Filter tools per phase to reduce token usage (Groq free-tier has small context)
                 if phase == "refactor":
-                    allowed = {"search_file", "rename_symbol", "get_git_diff", "read_file", "list_files"}
+                    allowed = {"rename_symbol", "replace_in_file", "read_file"}
                     tools = [t for t in all_tools if t.name in allowed]
                     system_prompt = (
-                        "You are an expert software engineer. You have tools to search files, "
-                        "rename Python symbols with AST resolution, and get git diffs.\n\n"
-                        "INSTRUCTIONS — follow these steps IN ORDER, then STOP:\n"
-                        "1. Use `search_file` to locate the Python file and confirm the symbol.\n"
-                        "2. Use `rename_symbol` with the relative file path, old identifier, and new identifier. "
-                        "This resolves the definition and repository-wide imports/references with Tree-sitter and validates every changed file.\n"
-                        "3. Use `get_git_diff` to verify your changes.\n"
-                        "4. Return the diff as your final answer. DO NOT call any more tools.\n\n"
-                        "CRITICAL RULES:\n"
-                        "- Do NOT use `replace_in_file`, `replace_lines`, or unrestricted text replacement.\n"
-                        "- Only rename valid Python identifiers through `rename_symbol`.\n"
-                        "- Do NOT repeat a tool call with the same arguments. If you already searched, move on.\n"
-                        "- Do NOT use branch, commit, push, or PR tools.\n"
-                        "- STOP after returning the diff or an explanation."
+                        "You are a precise code refactoring engineer.\n\n"
+                        "The user's request already contains the relevant file paths found by semantic search.\n"
+                        "DO NOT call search_file or list_files — the context is already given.\n\n"
+                        "INSTRUCTIONS — follow IN ORDER then STOP:\n"
+                        "1. Call `rename_symbol(file_path, old_name, new_name)` using the RELATIVE file path from the context.\n"
+                        "   OR call `replace_in_file(file_path, search_string, replacement_string)` for non-symbol changes.\n"
+                        "2. If the tool returns a 'not found' error, it means the symbol doesn't exist or was already renamed. "
+                        "Do not apologize. Simply output: 'The symbol could not be found. It may have already been renamed.' and STOP.\n"
+                        "3. Otherwise, if successful, return a short confirmation message and STOP."
                     )
                 else:
                     allowed = {"create_branch", "commit_changes", "push_branch", "create_pull_request"}
@@ -75,7 +70,7 @@ class RefactorAgent:
                 try:
                     result = await agent.ainvoke(
                         {"messages": [("user", prompt)]},
-                        config={"recursion_limit": 15},
+                        config={"recursion_limit": 6},
                     )
                     return result["messages"][-1].content
                 except Exception as inner_e:

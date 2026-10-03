@@ -78,7 +78,7 @@ class SupervisorAgent:
         symbol_candidates = [w for w in words if ("_" in w or w[:1].isupper()) and w.lower() not in stopwords]
         top_symbol = symbol_candidates[0] if symbol_candidates else None
         
-        refactor_terms = {"rename", "refactor", "replace", "rewrite", "change", "modify", "update", "move"}
+        refactor_terms = {"rename", "refactor", "replace", "rewrite", "move"}
         impact_terms  = {"dependent", "dependant", "depend", "dependencies", "impact", "affect",
                          "effect", "break", "uses", "callers", "calls", "blast"}
         search_terms  = {"where", "find", "locate", "which", "file", "defined", "implemented", "show"}
@@ -98,8 +98,6 @@ class SupervisorAgent:
             
         intent = state.get("intent")
         if intent == "impact":
-            return "dependency_graph"
-        if intent == "dependency_graph":
             return "dependency_graph"
         elif intent == "search" or intent == "refactor":
             return "semantic_search"
@@ -194,23 +192,44 @@ class SupervisorAgent:
         original_env_path = os.getenv("CODESENSE_REPO_PATH")
         os.environ["CODESENSE_REPO_PATH"] = staging_path
         
-        # Build a context-enriched prompt from semantic search results
+        # Build a context-enriched prompt with RELATIVE paths so the agent edits the sandbox, not live repo.
+        # res['file_path'] from the vector store is an absolute path to the original repo.
+        # We convert it to be relative to repo_path. The MCP server resolves it against
+        # CODESENSE_REPO_PATH (staging_path), so edits go into the sandbox — not the live working tree.
         context = ""
         if state.get("search_results"):
             context = "Relevant code from the repository:\n"
             for res in state["search_results"][:5]:
-                context += f"- File: {res['file_path']} (Lines {res['line_range']})\n"
+                abs_path = res['file_path']
+                try:
+                    rel_path = os.path.relpath(abs_path, repo_path)
+                except ValueError:
+                    # Different drive on Windows — use basename as best effort
+                    rel_path = os.path.basename(abs_path)
+                context += f"- File: `{rel_path}` (Lines {res['line_range']})\n"
                 context += f"```\n{res['snippet']}\n```\n\n"
-        
+
         prompt = f"{context}\nUser Request: {state['question']}"
         
         try:
-            diff_result = self.refactor_agent.run_sync(prompt, phase="refactor")
-            state["diff_data"] = diff_result
-            state["requires_approval"] = True
-            state["final_answer"] = (
-                "I have drafted the refactor in a secure sandbox. Please review the diff below and approve to create a PR."
-            )
+            agent_reply = self.refactor_agent.run_sync(prompt, phase="refactor")
+            
+            # Run git diff ourselves — the agent's text reply is NOT the diff
+            diff_result = subprocess.run(
+                ["git", "--no-pager", "diff"],
+                cwd=staging_path, capture_output=True, text=True, check=False,
+            ).stdout.strip()
+            
+            if diff_result:
+                state["diff_data"] = diff_result
+                state["requires_approval"] = True
+                state["final_answer"] = (
+                    "I have drafted the refactor in a secure sandbox. "
+                    "Please review the diff below and approve to create a PR."
+                )
+            else:
+                # Agent ran but made no file changes
+                state["final_answer"] = agent_reply or "The agent completed but no file changes were detected."
         except TimeoutError as error:
             # Fallback if the agent timed out but made edits
             diff_result = subprocess.run(
@@ -317,6 +336,7 @@ class SupervisorAgent:
         initial_state = CodeSenseState(
             question=question,
             intent=None,
+            _target_symbol=None,
             search_results=None,
             impact_results=None,
             final_answer=None,
