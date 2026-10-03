@@ -224,6 +224,53 @@ button:disabled {
   border-bottom-left-radius: 4px;
 }
 
+/* Markdown Styling */
+.message h1, .message h2, .message h3 {
+  margin-top: 1rem;
+  margin-bottom: 0.5rem;
+  color: var(--accent);
+}
+
+.message p {
+  margin-bottom: 0.8rem;
+}
+
+.message p:last-child {
+  margin-bottom: 0;
+}
+
+.message ul, .message ol {
+  margin-left: 1.5rem;
+  margin-bottom: 1rem;
+}
+
+.message li {
+  margin-bottom: 0.3rem;
+}
+
+.message code {
+  font-family: 'Fira Code', 'Courier New', Courier, monospace;
+  background: rgba(0, 0, 0, 0.3);
+  padding: 0.2rem 0.4rem;
+  border-radius: 4px;
+  font-size: 0.9em;
+}
+
+.message pre {
+  background: rgba(0, 0, 0, 0.5);
+  padding: 1rem;
+  border-radius: 8px;
+  overflow-x: auto;
+  border: 1px solid var(--panel-border);
+  margin: 1rem 0;
+}
+
+.message pre code {
+  background: transparent;
+  padding: 0;
+  color: #a5b4fc;
+}
+
 .message-wrapper.system .message {
   background: transparent;
   color: var(--accent);

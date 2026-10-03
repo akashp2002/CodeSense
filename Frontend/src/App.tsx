@@ -1,4 +1,5 @@
 import { useState, useRef, useEffect } from 'react';
+import ReactMarkdown from 'react-markdown';
 import './index.css';
 
 interface Message {
@@ -199,7 +200,7 @@ function App() {
             messages.map((msg) => (
               <div key={msg.id} className={`message-wrapper ${msg.role}`}>
                 <div className={`message ${msg.role === 'system' && isLoading && msg === messages[messages.length-1] ? 'pulse' : ''}`}>
-                  {msg.content}
+                  <ReactMarkdown>{msg.content}</ReactMarkdown>
                 </div>
                 {msg.diff && (
                   <div className="diff-container">
