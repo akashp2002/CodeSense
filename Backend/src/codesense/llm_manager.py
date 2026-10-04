@@ -19,32 +19,28 @@ def get_llm(
     has_anthropic = bool(os.getenv("ANTHROPIC_API_KEY"))
     
     if purpose == "fast":
-        primary = ChatGroq(model_name="openai/gpt-oss-20b", temperature=temperature, max_tokens=max_tokens or 256)
+        primary = ChatGroq(model_name="openai/gpt-oss-20b", temperature=temperature, max_tokens=max_tokens or 256, max_retries=0)
         
         fallbacks = []
         if has_openai:
-            fallbacks.append(ChatOpenAI(model="gpt-4o-mini", temperature=temperature, max_tokens=max_tokens or 256))
-        # Fallback to another fast free model on Groq
-        fallbacks.append(ChatGroq(model_name="qwen/qwen3.8-27b", temperature=temperature, max_tokens=max_tokens or 256))
+            fallbacks.append(ChatOpenAI(model="gpt-4o-mini", temperature=temperature, max_tokens=max_tokens or 256, max_retries=0))
+        fallbacks.append(ChatGroq(model_name="qwen/qwen3.8-27b", temperature=temperature, max_tokens=max_tokens or 256, max_retries=0))
         
         return primary.with_fallbacks(fallbacks) if fallbacks else primary
         
     elif purpose == "coding":
-        # If we have Anthropic, use Sonnet 3.5. Otherwise use the large OSS model on Groq
         if has_anthropic:
-            primary = ChatAnthropic(model_name="claude-3-5-sonnet-20240620", temperature=temperature, max_tokens=max_tokens or 2048)
+            primary = ChatAnthropic(model_name="claude-3-5-sonnet-20240620", temperature=temperature, max_tokens=max_tokens or 2048, max_retries=0)
         else:
-            primary = ChatGroq(model_name="openai/gpt-oss-120b", temperature=temperature, max_tokens=max_tokens or 2048)
+            primary = ChatGroq(model_name="openai/gpt-oss-120b", temperature=temperature, max_tokens=max_tokens or 2048, max_retries=0)
             
         fallbacks = []
         if has_openai:
-            fallbacks.append(ChatOpenAI(model="gpt-4o", temperature=temperature, max_tokens=max_tokens or 2048))
+            fallbacks.append(ChatOpenAI(model="gpt-4o", temperature=temperature, max_tokens=max_tokens or 2048, max_retries=0))
         if has_anthropic:
-            # If Anthropic was primary, add the OSS model as a fallback
-            fallbacks.append(ChatGroq(model_name="openai/gpt-oss-120b", temperature=temperature, max_tokens=max_tokens or 2048))
+            fallbacks.append(ChatGroq(model_name="openai/gpt-oss-120b", temperature=temperature, max_tokens=max_tokens or 2048, max_retries=0))
             
-        # Add another free Groq coding model just in case of rate limits
-        fallbacks.append(ChatGroq(model_name="qwen/qwen3.8-27b", temperature=temperature, max_tokens=max_tokens or 2048))
+        fallbacks.append(ChatGroq(model_name="qwen/qwen3.8-27b", temperature=temperature, max_tokens=max_tokens or 2048, max_retries=0))
         
         return primary.with_fallbacks(fallbacks) if fallbacks else primary
     
