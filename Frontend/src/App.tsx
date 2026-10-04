@@ -23,6 +23,12 @@ function App() {
   const [isCloning, setIsCloning] = useState(false);
   const [isDeleting, setIsDeleting] = useState(false);
   const [repoReady, setRepoReady] = useState(false);
+  const [authToken, setAuthToken] = useState(localStorage.getItem('authToken') || '');
+  const [authEmail, setAuthEmail] = useState('');
+  const [authPassword, setAuthPassword] = useState('');
+  const [authLoading, setAuthLoading] = useState(false);
+  const [authError, setAuthError] = useState('');
+  const [isRegistering, setIsRegistering] = useState(false);
   const [theme, setTheme] = useState<'light' | 'dark'>(() => {
     const saved = localStorage.getItem('theme');
     return (saved as 'light' | 'dark') || 'dark';
@@ -38,7 +44,91 @@ function App() {
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [messages]);
+    
+    // Save history whenever messages change
+    if (authToken && messages.length > 0) {
+      fetch('http://localhost:8001/history', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${authToken}`
+        },
+        body: JSON.stringify({ history: JSON.stringify(messages) })
+      }).catch(console.error);
+    }
+  }, [messages, authToken]);
+
+  // Load history on login/mount
+  useEffect(() => {
+    if (authToken) {
+      fetch('http://localhost:8001/history', {
+        headers: { 'Authorization': `Bearer ${authToken}` }
+      })
+      .then(res => res.json())
+      .then(data => {
+        if (data.history && data.history !== '[]') {
+          setMessages(JSON.parse(data.history));
+        }
+      })
+      .catch(console.error);
+    } else {
+      setMessages([]);
+    }
+  }, [authToken]);
+
+  // ─── Auth Handlers ───
+  const handleAuth = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setAuthLoading(true);
+    setAuthError('');
+    try {
+      const formData = new URLSearchParams();
+      formData.append('username', authEmail);
+      formData.append('password', authPassword);
+      
+      const endpoint = isRegistering ? 'http://localhost:8001/register' : 'http://localhost:8001/login';
+      const res = await fetch(endpoint, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: formData
+      });
+      const data = await res.json();
+      if (res.ok) {
+        setAuthToken(data.access_token);
+        localStorage.setItem('authToken', data.access_token);
+      } else {
+        setAuthError(data.detail || (isRegistering ? 'Registration failed' : 'Login failed'));
+      }
+    } catch (err) {
+      setAuthError('Network error connecting to server');
+    }
+    setAuthLoading(false);
+  };
+
+  const handleGuest = async () => {
+    setAuthLoading(true);
+    setAuthError('');
+    try {
+      const res = await fetch('http://localhost:8001/guest', { method: 'POST' });
+      const data = await res.json();
+      if (res.ok) {
+        setAuthToken(data.access_token);
+        localStorage.setItem('authToken', data.access_token);
+      } else {
+        setAuthError('Failed to start guest session');
+      }
+    } catch (err) {
+      setAuthError('Network error connecting to server');
+    }
+    setAuthLoading(false);
+  };
+
+  const handleLogout = () => {
+    setAuthToken('');
+    localStorage.removeItem('authToken');
+    setMessages([]);
+    setRepoReady(false);
+  };
 
   // ─── API Handlers ───
   const handleClone = async () => {
@@ -49,7 +139,10 @@ function App() {
     try {
       const res = await fetch('http://localhost:8001/clone', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 
+          'Content-Type': 'application/json',
+          ...(authToken ? { 'Authorization': `Bearer ${authToken}` } : {})
+        },
         body: JSON.stringify({ github_url: repoUrl }),
       });
       const data = await res.json();
@@ -105,7 +198,10 @@ function App() {
     if (!overrideQuery) setQuery('');
     setIsLoading(true);
 
-    const ws = new WebSocket('ws://localhost:8001/ws/query');
+    const wsUrl = authToken 
+      ? `ws://localhost:8001/ws/query?token=${encodeURIComponent(authToken)}`
+      : 'ws://localhost:8001/ws/query';
+    const ws = new WebSocket(wsUrl);
 
     ws.onopen = () => ws.send(JSON.stringify({ question: q }));
 
@@ -142,7 +238,10 @@ function App() {
       const repoName = repoUrl.split('/').pop() || 'demo';
       const res = await fetch('http://localhost:8001/create-pr', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 
+          'Content-Type': 'application/json',
+          ...(authToken ? { 'Authorization': `Bearer ${authToken}` } : {})
+        },
         body: JSON.stringify({ prompt, repo_name: repoName }),
       });
       const data = await res.json();
@@ -183,6 +282,22 @@ function App() {
             </button>
           </div>
           <p className="sidebar-subtitle">AI-powered codebase analysis & refactoring</p>
+        </div>
+
+        <div className="sidebar-section" style={{ marginTop: 'auto', borderTop: '1px solid var(--border-subtle)', paddingTop: '1rem' }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+            <div style={{ display: 'flex', flexDirection: 'column' }}>
+              <span style={{ fontSize: '0.75rem', color: 'var(--text-tertiary)', textTransform: 'uppercase', letterSpacing: '0.5px', fontWeight: 600 }}>Account</span>
+              <span style={{ fontSize: '0.85rem', color: 'var(--text-primary)', marginTop: '2px' }}>{authToken ? 'Active Session' : 'Guest'}</span>
+            </div>
+            <button 
+              onClick={handleLogout} 
+              className="btn btn-secondary" 
+              style={{ padding: '0.4rem 0.8rem', fontSize: '0.8rem', borderRadius: 'var(--radius-sm)', border: '1px solid var(--border-subtle)' }}
+            >
+              Sign Out
+            </button>
+          </div>
         </div>
 
         <div className="sidebar-section">
@@ -332,6 +447,63 @@ function App() {
           </p>
         </div>
       </main>
+
+      {/* ─── Auth Modal ─── */}
+      {!authToken && (
+        <div className="auth-overlay">
+          <div className="auth-modal">
+            <div className="auth-header" style={{ textAlign: 'center', marginBottom: '0.5rem' }}>
+              <h2 style={{ fontSize: '1.75rem', letterSpacing: '-0.5px' }}>CodeSense</h2>
+              <p style={{ marginTop: '0.25rem' }}>{isRegistering ? 'Create a new account' : 'Welcome back, sign in to continue'}</p>
+            </div>
+            
+            <div style={{ display: 'flex', gap: '0.5rem', marginBottom: '1rem', background: 'var(--bg-elevated)', padding: '0.25rem', borderRadius: 'var(--radius-md)' }}>
+              <button 
+                type="button" 
+                onClick={() => {setIsRegistering(false); setAuthError('');}}
+                style={{ flex: 1, padding: '0.5rem', borderRadius: 'var(--radius-sm)', border: 'none', background: !isRegistering ? 'var(--bg-surface)' : 'transparent', color: !isRegistering ? 'var(--text-primary)' : 'var(--text-secondary)', boxShadow: !isRegistering ? '0 1px 3px rgba(0,0,0,0.1)' : 'none', cursor: 'pointer', fontWeight: 500, transition: 'all 0.2s' }}
+              >
+                Sign In
+              </button>
+              <button 
+                type="button" 
+                onClick={() => {setIsRegistering(true); setAuthError('');}}
+                style={{ flex: 1, padding: '0.5rem', borderRadius: 'var(--radius-sm)', border: 'none', background: isRegistering ? 'var(--bg-surface)' : 'transparent', color: isRegistering ? 'var(--text-primary)' : 'var(--text-secondary)', boxShadow: isRegistering ? '0 1px 3px rgba(0,0,0,0.1)' : 'none', cursor: 'pointer', fontWeight: 500, transition: 'all 0.2s' }}
+              >
+                Register
+              </button>
+            </div>
+
+            <form onSubmit={handleAuth} className="auth-form">
+              <input 
+                type="email" 
+                placeholder="Email address" 
+                value={authEmail} 
+                onChange={e => setAuthEmail(e.target.value)} 
+                required 
+              />
+              <input 
+                type="password" 
+                placeholder="Password" 
+                value={authPassword} 
+                onChange={e => setAuthPassword(e.target.value)} 
+                required 
+              />
+              {authError && <div className="auth-error">{authError}</div>}
+              
+              <button type="submit" className="btn btn-primary auth-submit" disabled={authLoading} style={{ padding: '0.85rem', marginTop: '0.5rem', borderRadius: 'var(--radius-sm)' }}>
+                {authLoading ? (isRegistering ? 'Registering...' : 'Signing in...') : (isRegistering ? 'Create Account' : 'Sign In')}
+              </button>
+            </form>
+            
+            <div className="auth-divider" style={{ margin: '1.25rem 0' }}><span>or continue without an account</span></div>
+            
+            <button onClick={handleGuest} className="btn btn-secondary auth-guest" disabled={authLoading} style={{ width: '100%', padding: '0.85rem', borderRadius: 'var(--radius-sm)' }}>
+              Proceed as Guest
+            </button>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

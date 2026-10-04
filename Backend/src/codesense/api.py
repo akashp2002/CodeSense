@@ -1,11 +1,24 @@
 import os
 import uvicorn
 from pathlib import Path
-from fastapi import FastAPI, HTTPException, status
+from fastapi import FastAPI, HTTPException, status, Security, Depends
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import OAuth2PasswordRequestForm
 from pydantic import BaseModel
+import secrets
 from typing import Optional
 from dotenv import load_dotenv
+from sqlalchemy.orm import Session
+
+from codesense.database import get_db, User, ChatSession
+from codesense.auth import (
+    get_current_user, 
+    verify_password, 
+    get_password_hash, 
+    create_access_token,
+    ACCESS_TOKEN_EXPIRE_MINUTES,
+    GUEST_TOKEN_EXPIRE_MINUTES
+)
 
 load_dotenv(Path(__file__).resolve().parents[2] / ".env")
 
@@ -93,12 +106,106 @@ async def lifespan(app):
 
 app = FastAPI(title="CodeSense API", description="AI Agent for Codebase QA & Impact Analysis", lifespan=lifespan)
 
+frontend_url = os.getenv("FRONTEND_URL", "http://localhost:5173")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[frontend_url, "http://localhost:3000"] if frontend_url != "*" else ["*"],
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+def verify_api_key(user: User = Depends(get_current_user)):
+    # Aliased to prevent rewriting all endpoint dependencies
+    return user
+
+# ── Auth Endpoints ──
+
+@app.post("/register")
+def register(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
+    user = db.query(User).filter(User.email == form_data.username).first()
+    if user:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="User with this email already exists"
+        )
+    
+    new_user = User(
+        email=form_data.username,
+        hashed_password=get_password_hash(form_data.password)
+    )
+    db.add(new_user)
+    db.commit()
+    db.refresh(new_user)
+    
+    access_token = create_access_token(
+        data={"sub": str(new_user.id), "role": "authenticated"},
+        expires_delta=__import__('datetime').timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    )
+    return {"access_token": access_token, "token_type": "bearer"}
+
+@app.post("/login")
+def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
+    user = db.query(User).filter(User.email == form_data.username).first()
+    if not user or not verify_password(form_data.password, user.hashed_password):
+        # Fallback to auto-registration for demo purposes if user doesn't exist
+        if not user and form_data.username:
+            user = User(
+                email=form_data.username,
+                hashed_password=get_password_hash(form_data.password)
+            )
+            db.add(user)
+            db.commit()
+            db.refresh(user)
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Incorrect username or password",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+            
+    access_token = create_access_token(
+        data={"sub": str(user.id), "role": "authenticated"},
+        expires_delta=__import__('datetime').timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    )
+    return {"access_token": access_token, "token_type": "bearer"}
+
+@app.post("/guest")
+def login_guest(db: Session = Depends(get_db)):
+    guest_user = User(is_guest=True)
+    db.add(guest_user)
+    db.commit()
+    db.refresh(guest_user)
+    
+    access_token = create_access_token(
+        data={"sub": str(guest_user.id), "role": "guest"},
+        expires_delta=__import__('datetime').timedelta(minutes=GUEST_TOKEN_EXPIRE_MINUTES)
+    )
+    return {"access_token": access_token, "token_type": "bearer"}
+
+
+# ── History Endpoints ──
+
+class HistoryRequest(BaseModel):
+    history: str
+
+@app.get("/history", dependencies=[Depends(verify_api_key)])
+def get_history(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    session = db.query(ChatSession).filter(ChatSession.user_id == user.id).order_by(ChatSession.id.desc()).first()
+    if not session:
+        return {"history": "[]"}
+    return {"history": session.history or "[]"}
+
+@app.post("/history", dependencies=[Depends(verify_api_key)])
+def save_history(request: HistoryRequest, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    session = db.query(ChatSession).filter(ChatSession.user_id == user.id).order_by(ChatSession.id.desc()).first()
+    if not session:
+        session = ChatSession(user_id=user.id, repo_path="default", history=request.history)
+        db.add(session)
+    else:
+        session.history = request.history
+    db.commit()
+    return {"status": "ok"}
 
 # Lazy-loaded supervisor (shared singleton to avoid Qdrant lock issues)
 _supervisor: Optional[SupervisorAgent] = None
@@ -194,7 +301,7 @@ def health_check():
         return JSONResponse(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, content=response)
     return response
 
-@app.post("/clone")
+@app.post("/clone", dependencies=[Depends(verify_api_key)])
 def api_clone(request: CloneRequest):
     """Clone a GitHub repository to the local repos/ directory and incrementally index changes."""
     try:
@@ -222,7 +329,7 @@ def api_clone(request: CloneRequest):
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-@app.post("/delete-repository")
+@app.post("/delete-repository", dependencies=[Depends(verify_api_key)])
 def api_delete_repository(request: DeleteRepositoryRequest):
     """Delete the currently selected cloned repository."""
     reset_supervisor()
@@ -236,7 +343,7 @@ def api_delete_repository(request: DeleteRepositoryRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Could not delete repository: {e}") from e
 
-@app.post("/index-vectors")
+@app.post("/index-vectors", dependencies=[Depends(verify_api_key)])
 def api_index_vectors(request: IndexRequest):
     """Build the semantic vector index for a local repository path."""
     if not os.path.exists(request.repo_path):
@@ -298,7 +405,7 @@ def api_index_vectors(request: IndexRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/index-graph")
+@app.post("/index-graph", dependencies=[Depends(verify_api_key)])
 def api_index_graph(request: IndexRequest):
     """Build the Neo4j dependency graph for a local repository path."""
     if not os.path.exists(request.repo_path):
@@ -351,7 +458,23 @@ import asyncio
 import traceback
 
 @app.websocket("/ws/query")
-async def websocket_query(websocket: WebSocket):
+async def websocket_query(websocket: WebSocket, token: Optional[str] = None):
+    try:
+        if not token:
+            await websocket.close(code=1008, reason="Missing auth token")
+            return
+            
+        import jwt
+        from codesense.auth import SECRET_KEY, ALGORITHM
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        user_id = payload.get("sub")
+        if not user_id:
+            await websocket.close(code=1008, reason="Invalid token")
+            return
+    except Exception:
+        await websocket.close(code=1008, reason="Invalid auth token")
+        return
+        
     await websocket.accept()
     try:
         data = await websocket.receive_json()
@@ -436,7 +559,7 @@ async def websocket_query(websocket: WebSocket):
         except:
             pass
 
-@app.get("/search")
+@app.get("/search", dependencies=[Depends(verify_api_key)])
 def api_search(q: str, limit: int = 5):
     """Semantic search across codebase."""
     agent = get_supervisor().search_agent
@@ -450,13 +573,13 @@ def api_impact(symbol: str, hops: int = 3):
     results = agent.get_impact(symbol, max_hops=hops)
     return results
 
-@app.get("/graph/{symbol}")
+@app.get("/graph/{symbol}", dependencies=[Depends(verify_api_key)])
 def api_graph_neighborhood(symbol: str, hops: int = 2):
     """Get raw graph nodes and edges for visualization."""
     store = get_supervisor().graph_agent.graph_store
     return store.get_neighborhood(symbol, max_hops=hops)
 
-@app.post("/query", response_model=QueryResponse)
+@app.post("/query", response_model=QueryResponse, dependencies=[Depends(verify_api_key)])
 def api_query(request: QueryRequest):
     """Natural language Q&A using the LangGraph Supervisor."""
     agent = get_supervisor()
@@ -481,7 +604,7 @@ def api_query(request: QueryRequest):
         print(f"{'='*60}\n")
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/create-pr")
+@app.post("/create-pr", dependencies=[Depends(verify_api_key)])
 def api_create_pr(request: CreatePRRequest):
     """Resume the refactor flow to push the PR after human approval."""
     import subprocess
@@ -556,7 +679,7 @@ def api_create_pr(request: CreatePRRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Could not create Pull Request: {e}") from e
 
-@app.post("/reindex")
+@app.post("/reindex", dependencies=[Depends(verify_api_key)])
 def api_reindex():
     """Force a full re-index of the currently active repository. Use when indexes become stale."""
     repo_path = os.getenv("CODESENSE_REPO_PATH")
