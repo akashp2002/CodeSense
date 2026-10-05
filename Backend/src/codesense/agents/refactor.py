@@ -17,7 +17,7 @@ class RefactorAgent:
     Always uses its own tool-calling model (not inherited from the Supervisor).
     """
 
-    def __init__(self, model_name: str = "qwen/qwen3.8-27b"):
+    def __init__(self, model_name: str = "qwen/qwen3.8-27b", vector_store=None):
         self.llm = get_llm(purpose="coding", temperature=0, max_tokens=512)
         self.timeout_seconds = 120
 

@@ -10,8 +10,9 @@ NEO4J_USER = os.getenv("NEO4J_USER", "neo4j")
 NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "codesense_password")
 
 class GraphStore:
-    def __init__(self, uri: str = NEO4J_URI, user: str = NEO4J_USER, password: str = NEO4J_PASSWORD):
+    def __init__(self, user_id: str = "default", uri: str = NEO4J_URI, user: str = NEO4J_USER, password: str = NEO4J_PASSWORD):
         self.driver = GraphDatabase.driver(uri, auth=(user, password))
+        self.user_id = user_id
 
     def close(self):
         self.driver.close()
@@ -19,7 +20,7 @@ class GraphStore:
     def clear_graph(self):
         """Clear all nodes and edges (useful for re-indexing)."""
         with self.driver.session() as session:
-            session.run("MATCH (n) DETACH DELETE n")
+            session.run("MATCH (n) WHERE n.tenant_id = $tenant_id DETACH DELETE n", tenant_id=self.user_id)
 
     def delete_file_nodes(self, file_path: str):
         """Delete all nodes associated with a specific file to support incremental updates.
@@ -29,10 +30,11 @@ class GraphStore:
             session.run(
                 """
                 MATCH (n)
-                WHERE (n:Symbol AND n.file_path = $file_path) OR (n:File AND n.path = $file_path)
+                WHERE ((n:Symbol AND n.file_path = $file_path) OR (n:File AND n.path = $file_path)) AND n.tenant_id = $tenant_id
                 DETACH DELETE n
                 """,
-                file_path=file_path
+                file_path=file_path,
+                tenant_id=self.user_id
             )
 
     def index_chunks(self, chunks: List[CodeChunk]):
@@ -42,6 +44,7 @@ class GraphStore:
                 session.run(
                     """
                     MERGE (s:Symbol {
+                        tenant_id: $tenant_id,
                         file_path: $file_path,
                         symbol_name: $symbol_name,
                         start_line: $start_line
@@ -51,6 +54,7 @@ class GraphStore:
                         s.signature = $signature,
                         s.docstring = $docstring
                     """,
+                    tenant_id=self.user_id,
                     file_path=chunk.file_path,
                     symbol_name=chunk.symbol_name,
                     start_line=chunk.line_range.start_line,
@@ -80,10 +84,11 @@ class GraphStore:
                     # Precise edge: Symbol → [REL] → Symbol
                     session.run(
                         f"""
-                        MERGE (source:Symbol {{symbol_name: $caller_symbol}})
-                        MERGE (target:Symbol {{symbol_name: $callee_symbol}})
+                        MERGE (source:Symbol {{tenant_id: $tenant_id, symbol_name: $caller_symbol}})
+                        MERGE (target:Symbol {{tenant_id: $tenant_id, symbol_name: $callee_symbol}})
                         MERGE (source)-[:{rel_type} {{line: $line_number, file: $file_path}}]->(target)
                         """,
+                        tenant_id=self.user_id,
                         caller_symbol=ref.caller_symbol,
                         callee_symbol=ref.symbol_name,
                         line_number=ref.line_number,
@@ -93,12 +98,13 @@ class GraphStore:
                     # Module-level imports should point at indexed definitions when available.
                     session.run(
                         f"""
-                        MERGE (source:File {{path: $file_path}})
+                        MERGE (source:File {{tenant_id: $tenant_id, path: $file_path}})
                         WITH source
-                        OPTIONAL MATCH (target:Symbol {{symbol_name: $symbol_name}})
+                        OPTIONAL MATCH (target:Symbol {{tenant_id: $tenant_id, symbol_name: $symbol_name}})
                         FOREACH (resolved_target IN CASE WHEN target IS NULL THEN [] ELSE [target] END |
                             MERGE (source)-[:{rel_type} {{line: $line_number}}]->(resolved_target))
                         """,
+                        tenant_id=self.user_id,
                         file_path=ref.file_path,
                         symbol_name=ref.symbol_name,
                         line_number=ref.line_number
@@ -114,13 +120,14 @@ class GraphStore:
             result = session.run(
                 f"""
                      MATCH (target:Symbol)
-                     WHERE target.symbol_name = $symbol_name
-                         OR toLower(target.file_path) CONTAINS toLower($symbol_name)
+                     WHERE target.tenant_id = $tenant_id AND (target.symbol_name = $symbol_name
+                         OR toLower(target.file_path) CONTAINS toLower($symbol_name))
                 MATCH (source)-[:CALLS|IMPORTS|INHERITS_FROM*1..{max_hops}]->(target)
                   RETURN DISTINCT coalesce(source.file_path, source.path) AS file_path,
                       source.symbol_name AS symbol_name,
                        labels(source) AS node_type
                 """,
+                tenant_id=self.user_id,
                 symbol_name=symbol_name
             )
             return [dict(record) for record in result]
@@ -132,9 +139,10 @@ class GraphStore:
         with self.driver.session() as session:
             result = session.run(
                 """
-                MATCH (source:Symbol {symbol_name: $symbol_name})-[:CALLS|IMPORTS]->(target)
+                MATCH (source:Symbol {tenant_id: $tenant_id, symbol_name: $symbol_name})-[:CALLS|IMPORTS]->(target)
                 RETURN DISTINCT target.symbol_name AS symbol_name, target.file_path AS file_path
                 """,
+                tenant_id=self.user_id,
                 symbol_name=symbol_name
             )
             return [dict(record) for record in result]
@@ -148,9 +156,10 @@ class GraphStore:
             # Query for paths up to max_hops away (both incoming and outgoing)
             result = session.run(
                 f"""
-                MATCH path = (start:Symbol {{symbol_name: $symbol_name}})-[*1..{max_hops}]-(other)
+                MATCH path = (start:Symbol {{tenant_id: $tenant_id, symbol_name: $symbol_name}})-[*1..{max_hops}]-(other)
                 RETURN path
                 """,
+                tenant_id=self.user_id,
                 symbol_name=symbol_name
             )
             
@@ -159,7 +168,8 @@ class GraphStore:
             
             # Also add the starting node itself in case it has no edges
             start_result = session.run(
-                "MATCH (n:Symbol {symbol_name: $symbol_name}) RETURN n", 
+                "MATCH (n:Symbol {tenant_id: $tenant_id, symbol_name: $symbol_name}) RETURN n", 
+                tenant_id=self.user_id,
                 symbol_name=symbol_name
             )
             for record in start_result:

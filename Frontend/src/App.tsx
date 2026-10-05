@@ -33,7 +33,25 @@ function App() {
     const saved = localStorage.getItem('theme');
     return (saved as 'light' | 'dark') || 'dark';
   });
+  const [userId, setUserId] = useState<string>('');
   const messagesEndRef = useRef<HTMLDivElement>(null);
+
+  // Helper to extract user_id from JWT
+  const getUserIdFromToken = (token: string): string => {
+    try {
+      const payload = JSON.parse(atob(token.split('.')[1]));
+      return payload.sub || '';
+    } catch {
+      return '';
+    }
+  };
+
+  // Restore userId from stored token on mount
+  useEffect(() => {
+    if (authToken) {
+      setUserId(getUserIdFromToken(authToken));
+    }
+  }, []);
 
   useEffect(() => {
     document.documentElement.setAttribute('data-theme', theme);
@@ -95,6 +113,7 @@ function App() {
       const data = await res.json();
       if (res.ok) {
         setAuthToken(data.access_token);
+        setUserId(getUserIdFromToken(data.access_token));
         localStorage.setItem('authToken', data.access_token);
       } else {
         setAuthError(data.detail || (isRegistering ? 'Registration failed' : 'Login failed'));
@@ -113,6 +132,7 @@ function App() {
       const data = await res.json();
       if (res.ok) {
         setAuthToken(data.access_token);
+        setUserId(getUserIdFromToken(data.access_token));
         localStorage.setItem('authToken', data.access_token);
       } else {
         setAuthError('Failed to start guest session');
@@ -125,6 +145,7 @@ function App() {
 
   const handleLogout = () => {
     setAuthToken('');
+    setUserId('');
     localStorage.removeItem('authToken');
     setMessages([]);
     setRepoReady(false);
@@ -167,8 +188,11 @@ function App() {
     try {
       const res = await fetch('http://localhost:8001/delete-repository', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ repo_path: `repos/${repoName}` }),
+        headers: { 
+          'Content-Type': 'application/json',
+          ...(authToken ? { 'Authorization': `Bearer ${authToken}` } : {})
+        },
+        body: JSON.stringify({ repo_path: `repos/${userId}/${repoName}` }),
       });
       if (res.ok) {
         addMessage('system', `Repository "${repoName}" removed.`);
@@ -284,21 +308,23 @@ function App() {
           <p className="sidebar-subtitle">AI-powered codebase analysis & refactoring</p>
         </div>
 
-        <div className="sidebar-section" style={{ marginTop: 'auto', borderTop: '1px solid var(--border-subtle)', paddingTop: '1rem' }}>
-          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-            <div style={{ display: 'flex', flexDirection: 'column' }}>
-              <span style={{ fontSize: '0.75rem', color: 'var(--text-tertiary)', textTransform: 'uppercase', letterSpacing: '0.5px', fontWeight: 600 }}>Account</span>
-              <span style={{ fontSize: '0.85rem', color: 'var(--text-primary)', marginTop: '2px' }}>{authToken ? 'Active Session' : 'Guest'}</span>
+        {authToken && (
+          <div className="sidebar-section" style={{ marginTop: 'auto', borderTop: '1px solid var(--border-subtle)', paddingTop: '1rem' }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+              <div style={{ display: 'flex', flexDirection: 'column' }}>
+                <span style={{ fontSize: '0.75rem', color: 'var(--text-tertiary)', textTransform: 'uppercase', letterSpacing: '0.5px', fontWeight: 600 }}>Account</span>
+                <span style={{ fontSize: '0.85rem', color: 'var(--text-primary)', marginTop: '2px' }}>Active Session</span>
+              </div>
+              <button 
+                onClick={handleLogout} 
+                className="btn btn-secondary" 
+                style={{ padding: '0.4rem 0.8rem', fontSize: '0.8rem', borderRadius: 'var(--radius-sm)', border: '1px solid var(--border-subtle)' }}
+              >
+                Sign Out
+              </button>
             </div>
-            <button 
-              onClick={handleLogout} 
-              className="btn btn-secondary" 
-              style={{ padding: '0.4rem 0.8rem', fontSize: '0.8rem', borderRadius: 'var(--radius-sm)', border: '1px solid var(--border-subtle)' }}
-            >
-              Sign Out
-            </button>
           </div>
-        </div>
+        )}
 
         <div className="sidebar-section">
           <p className="sidebar-section-title">Repository</p>

@@ -17,7 +17,7 @@ def _iter_source_files(path: Path):
         if file_path.suffix.lower() in SUPPORTED_EXTENSIONS and not any(part in SKIP_DIRS for part in file_path.parts):
             yield file_path
 
-def index_repo(repo_path: str):
+def index_repo(repo_path: str, vector_store=None):
     path = Path(repo_path)
     if not path.exists() or not path.is_dir():
         print(f"Error: {repo_path} is not a valid directory.")
@@ -25,7 +25,10 @@ def index_repo(repo_path: str):
         
     parser = CodeParser()
     chunker = SemanticChunker()
-    vector_store = VectorStore()
+    close_vs = False
+    if vector_store is None:
+        vector_store = VectorStore()
+        close_vs = True
     
     print(f"--- Indexing repository {repo_path} ---")
     all_chunks = []
@@ -41,10 +44,10 @@ def index_repo(repo_path: str):
     print(f"\nExtracted a total of {len(all_chunks)} chunks. Embedding and indexing...")
     vector_store.clear_collection()
     vector_store.index_chunks(all_chunks)
-    vector_store.client.close()
+    # DO NOT close vector_store.client since it's a shared singleton
     print("Vector indexing complete.")
 
-def graph_index_repo(repo_path: str):
+def graph_index_repo(repo_path: str, graph_store=None):
     path = Path(repo_path)
     if not path.exists() or not path.is_dir():
         print(f"Error: {repo_path} is not a valid directory.")
@@ -53,7 +56,10 @@ def graph_index_repo(repo_path: str):
     parser = CodeParser()
     chunker = SemanticChunker()
     extractor = SymbolExtractor()
-    graph_store = GraphStore()
+    close_gs = False
+    if graph_store is None:
+        graph_store = GraphStore()
+        close_gs = True
     
     print(f"--- Graph-indexing repository {repo_path} ---")
     print("Clearing existing graph...")
@@ -76,14 +82,15 @@ def graph_index_repo(repo_path: str):
     graph_store.index_chunks(all_chunks)
     print(f"Inserting {len(all_refs)} edges into Neo4j...")
     graph_store.index_references(all_refs)
-    graph_store.close()
+    if close_gs:
+        graph_store.close()
     print("Graph indexing complete.")
 
 
-def refresh_indexes(repo_path: str):
+def refresh_indexes(repo_path: str, vector_store=None, graph_store=None):
     """Rebuild both indexes from the repository's current working tree."""
-    index_repo(repo_path)
-    graph_index_repo(repo_path)
+    index_repo(repo_path, vector_store=vector_store)
+    graph_index_repo(repo_path, graph_store=graph_store)
 
 
 def incremental_refresh_indexes(repo_path: str, vector_store=None, graph_store=None, changed_files: list[str] = None) -> str:
@@ -151,8 +158,7 @@ def incremental_refresh_indexes(repo_path: str, vector_store=None, graph_store=N
         except Exception as e:
             print(f"  Error re-indexing {rel_file}: {e}")
 
-    if close_vector:
-        vector_store.client.close()
+    # DO NOT close vector_store.client
     if close_graph:
         graph_store.close()
 

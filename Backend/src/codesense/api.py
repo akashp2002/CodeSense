@@ -207,29 +207,30 @@ def save_history(request: HistoryRequest, user: User = Depends(get_current_user)
     db.commit()
     return {"status": "ok"}
 
-# Lazy-loaded supervisor (shared singleton to avoid Qdrant lock issues)
-_supervisor: Optional[SupervisorAgent] = None
+# Lazy-loaded supervisors (isolated per user)
+_supervisors: dict[str, SupervisorAgent] = {}
 
-def get_supervisor():
-    global _supervisor
-    if _supervisor is None:
-        _supervisor = SupervisorAgent()
-    return _supervisor
+def get_supervisor(user_id: int):
+    global _supervisors
+    uid = str(user_id)
+    if uid not in _supervisors:
+        _supervisors[uid] = SupervisorAgent(user_id=uid)
+    return _supervisors[uid]
 
-def reset_supervisor():
+def reset_supervisor(user_id: int):
     """Close the old supervisor's Qdrant client and force re-initialization."""
-    global _supervisor
-    if _supervisor is not None:
+    global _supervisors
+    uid = str(user_id)
+    if uid in _supervisors:
         try:
-            # Explicitly close the Qdrant client to release the file lock
-            _supervisor.search_agent.vector_store.client.close()
+            pass # DO NOT close vector_store.client since it's a shared singleton
         except Exception:
             pass
         try:
-            _supervisor.graph_agent.graph_store.close()
+            _supervisors[uid].graph_agent.graph_store.close()
         except Exception:
             pass
-    _supervisor = None
+        del _supervisors[uid]
 
 # ── Request / Response Models ──
 
@@ -274,9 +275,6 @@ def health_check():
         checks["qdrant"] = {"status": "ok", "path": str(DEFAULT_QDRANT_PATH)}
     except Exception as error:
         checks["qdrant"] = {"status": "error", "detail": str(error)}
-    finally:
-        if qdrant_client is not None:
-            qdrant_client.close()
 
     graph_store = None
     try:
@@ -301,11 +299,11 @@ def health_check():
         return JSONResponse(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, content=response)
     return response
 
-@app.post("/clone", dependencies=[Depends(verify_api_key)])
-def api_clone(request: CloneRequest):
+@app.post("/clone")
+def api_clone(request: CloneRequest, user: User = Depends(get_current_user)):
     """Clone a GitHub repository to the local repos/ directory and incrementally index changes."""
     try:
-        result = clone_repository(request.github_url)
+        result = clone_repository(request.github_url, user_id=str(user.id))
         repo_path = result["local_path"]
         os.environ["CODESENSE_REPO_PATH"] = repo_path
         
@@ -314,7 +312,7 @@ def api_clone(request: CloneRequest):
             if len(changed_files) > 0:
                 print(f"Incremental sync: {len(changed_files)} files changed. Re-indexing...")
                 from codesense.cli import incremental_refresh_indexes
-                agent = get_supervisor()
+                agent = get_supervisor(user.id)
                 index_msg = incremental_refresh_indexes(
                     repo_path,
                     vector_store=agent.search_agent.vector_store,
@@ -329,10 +327,15 @@ def api_clone(request: CloneRequest):
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-@app.post("/delete-repository", dependencies=[Depends(verify_api_key)])
-def api_delete_repository(request: DeleteRepositoryRequest):
+@app.post("/delete-repository")
+def api_delete_repository(request: DeleteRepositoryRequest, user: User = Depends(get_current_user)):
     """Delete the currently selected cloned repository."""
-    reset_supervisor()
+    # Ensure multi-tenant security
+    expected_prefix = f"repos/{user.id}/"
+    if not request.repo_path.replace("\\", "/").startswith(expected_prefix):
+        raise HTTPException(status_code=403, detail="Not authorized to delete this repository.")
+        
+    reset_supervisor(user.id)
     try:
         delete_repository(request.repo_path)
         if os.environ.get("CODESENSE_REPO_PATH") == request.repo_path:
@@ -343,14 +346,18 @@ def api_delete_repository(request: DeleteRepositoryRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Could not delete repository: {e}") from e
 
-@app.post("/index-vectors", dependencies=[Depends(verify_api_key)])
-def api_index_vectors(request: IndexRequest):
+@app.post("/index-vectors")
+def api_index_vectors(request: IndexRequest, user: User = Depends(get_current_user)):
     """Build the semantic vector index for a local repository path."""
+    expected_prefix = f"repos/{user.id}/"
+    if not request.repo_path.replace("\\", "/").startswith(expected_prefix):
+        raise HTTPException(status_code=403, detail="Not authorized to index this repository.")
+        
     if not os.path.exists(request.repo_path):
         raise HTTPException(status_code=400, detail="Repository path does not exist.")
     
     # Reset supervisor so it picks up the new index
-    reset_supervisor()
+    reset_supervisor(user.id)
     
     try:
         from pathlib import Path
@@ -364,7 +371,7 @@ def api_index_vectors(request: IndexRequest):
         
         parser = CodeParser()
         chunker = SemanticChunker()
-        vector_store = VectorStore()
+        vector_store = VectorStore(user_id=str(user.id))
         vector_store.clear_collection()
         
         all_chunks = []
@@ -391,7 +398,7 @@ def api_index_vectors(request: IndexRequest):
                 "parse_errors": parse_errors[:10],
             }
         finally:
-            vector_store.client.close()
+            pass # Do not close shared client
     except RuntimeError as e:
         if "already accessed by another instance" in str(e):
             raise HTTPException(
@@ -405,9 +412,13 @@ def api_index_vectors(request: IndexRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/index-graph", dependencies=[Depends(verify_api_key)])
-def api_index_graph(request: IndexRequest):
+@app.post("/index-graph")
+def api_index_graph(request: IndexRequest, user: User = Depends(get_current_user)):
     """Build the Neo4j dependency graph for a local repository path."""
+    expected_prefix = f"repos/{user.id}/"
+    if not request.repo_path.replace("\\", "/").startswith(expected_prefix):
+        raise HTTPException(status_code=403, detail="Not authorized to index this repository.")
+        
     if not os.path.exists(request.repo_path):
         raise HTTPException(status_code=400, detail="Repository path does not exist.")
     
@@ -424,7 +435,7 @@ def api_index_graph(request: IndexRequest):
         parser = CodeParser()
         chunker = SemanticChunker()
         extractor = SymbolExtractor()
-        graph_store = GraphStore()
+        graph_store = GraphStore(user_id=str(user.id))
         
         graph_store.clear_graph()
         
@@ -483,7 +494,7 @@ async def websocket_query(websocket: WebSocket, token: Optional[str] = None):
             await websocket.send_json({"type": "error", "message": "No question provided"})
             return
             
-        agent = get_supervisor()
+        agent = get_supervisor(user_id)
         
         await websocket.send_json({"type": "status", "message": "Starting agent workflow..."})
         
@@ -559,30 +570,30 @@ async def websocket_query(websocket: WebSocket, token: Optional[str] = None):
         except:
             pass
 
-@app.get("/search", dependencies=[Depends(verify_api_key)])
-def api_search(q: str, limit: int = 5):
+@app.get("/search")
+def api_search(q: str, limit: int = 5, user: User = Depends(get_current_user)):
     """Semantic search across codebase."""
-    agent = get_supervisor().search_agent
+    agent = get_supervisor(user.id).search_agent
     results = agent.search_codebase(q, limit=limit)
     return {"results": results}
 
 @app.get("/impact/{symbol}")
-def api_impact(symbol: str, hops: int = 3):
+def api_impact(symbol: str, hops: int = 3, user: User = Depends(get_current_user)):
     """Dependency impact analysis for a symbol."""
-    agent = get_supervisor().graph_agent
+    agent = get_supervisor(user.id).graph_agent
     results = agent.get_impact(symbol, max_hops=hops)
     return results
 
-@app.get("/graph/{symbol}", dependencies=[Depends(verify_api_key)])
-def api_graph_neighborhood(symbol: str, hops: int = 2):
+@app.get("/graph/{symbol}")
+def api_graph_neighborhood(symbol: str, hops: int = 2, user: User = Depends(get_current_user)):
     """Get raw graph nodes and edges for visualization."""
-    store = get_supervisor().graph_agent.graph_store
+    store = get_supervisor(user.id).graph_agent.graph_store
     return store.get_neighborhood(symbol, max_hops=hops)
 
-@app.post("/query", response_model=QueryResponse, dependencies=[Depends(verify_api_key)])
-def api_query(request: QueryRequest):
+@app.post("/query", response_model=QueryResponse)
+def api_query(request: QueryRequest, user: User = Depends(get_current_user)):
     """Natural language Q&A using the LangGraph Supervisor."""
-    agent = get_supervisor()
+    agent = get_supervisor(user.id)
     try:
         result_state = agent.run(request.question)
         if "error" in result_state and result_state["error"]:
@@ -604,8 +615,8 @@ def api_query(request: QueryRequest):
         print(f"{'='*60}\n")
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/create-pr", dependencies=[Depends(verify_api_key)])
-def api_create_pr(request: CreatePRRequest):
+@app.post("/create-pr")
+def api_create_pr(request: CreatePRRequest, user: User = Depends(get_current_user)):
     """Resume the refactor flow to push the PR after human approval."""
     import subprocess
     import shutil
@@ -619,15 +630,13 @@ def api_create_pr(request: CreatePRRequest):
             pass
     
     try:
-        repo_path = os.getenv("CODESENSE_REPO_PATH")
-        if not repo_path:
-            repo_path = str(Path("repos") / request.repo_name)
+        repo_path = str(Path("repos") / str(user.id) / request.repo_name)
 
         staging_path = repo_path + "_staging"
         if not os.path.exists(staging_path):
             raise HTTPException(status_code=400, detail="Staging sandbox not found. Cannot approve.")
 
-        agent = get_supervisor()
+        agent = get_supervisor(user.id)
         
         # Step 1: Find which files changed in the staging sandbox
         changed_files = subprocess.run(
@@ -679,23 +688,26 @@ def api_create_pr(request: CreatePRRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Could not create Pull Request: {e}") from e
 
-@app.post("/reindex", dependencies=[Depends(verify_api_key)])
-def api_reindex():
-    """Force a full re-index of the currently active repository. Use when indexes become stale."""
-    repo_path = os.getenv("CODESENSE_REPO_PATH")
-    if not repo_path:
-        # Fallback: use the first cloned repo found in repos/
-        repos_dir = Path(__file__).resolve().parent.parent.parent / "repos"
-        candidates = [p for p in repos_dir.iterdir() if p.is_dir() and not p.name.endswith("_staging")] if repos_dir.exists() else []
-        if candidates:
-            repo_path = str(candidates[0])
-            os.environ["CODESENSE_REPO_PATH"] = repo_path
+@app.post("/reindex")
+def api_reindex(request: IndexRequest, user: User = Depends(get_current_user)):
+    """Force a full re-index of the specified repository."""
+    expected_prefix = f"repos/{user.id}/"
+    if not request.repo_path.replace("\\", "/").startswith(expected_prefix):
+        raise HTTPException(status_code=403, detail="Not authorized to re-index this repository.")
+        
+    repo_path = request.repo_path
     if not repo_path or not os.path.exists(repo_path):
-        raise HTTPException(status_code=400, detail="No active repository. Clone one first via /clone.")
+        raise HTTPException(status_code=400, detail="Repository path does not exist.")
+        
     try:
-        reset_supervisor()
+        reset_supervisor(user.id)
         from codesense.cli import refresh_indexes
-        refresh_indexes(repo_path)
+        
+        # Need to pass isolated instances to refresh_indexes
+        agent = get_supervisor(user.id)
+        # Assuming refresh_indexes in cli.py can accept these or we just do it manually here.
+        # It's better to just call index endpoints logic, but for now we'll do:
+        refresh_indexes(repo_path, vector_store=agent.search_agent.vector_store, graph_store=agent.graph_agent.graph_store)
         return {"status": "ok", "message": f"Re-indexed {repo_path} successfully."}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Re-index failed: {e}")

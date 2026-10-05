@@ -9,12 +9,22 @@ from typing import List
 
 DEFAULT_QDRANT_PATH = Path(__file__).resolve().parents[2] / ".qdrant_db"
 
+# Shared singleton client to avoid file-lock conflicts in embedded mode
+_shared_client: QdrantClient | None = None
+
+def _get_shared_client(path: str | None = None) -> QdrantClient:
+    global _shared_client
+    if _shared_client is None:
+        storage_path = str(DEFAULT_QDRANT_PATH if path is None else path)
+        _shared_client = QdrantClient(path=storage_path)
+    return _shared_client
+
 
 class VectorStore:
-    def __init__(self, collection_name: str = "code_chunks", path: str | None = None):
-        storage_path = str(DEFAULT_QDRANT_PATH if path is None else path)
-        self.client = QdrantClient(path=storage_path)
-        self.collection_name = collection_name
+    def __init__(self, user_id: str = "default", path: str | None = None):
+        self.client = _get_shared_client(path)
+        self.user_id = user_id
+        self.collection_name = f"code_chunks_{user_id}"
         # Using a fast, lightweight local embedding model
         self.model = SentenceTransformer("all-MiniLM-L6-v2")
         self.sparse_model = SparseTextEmbedding("Qdrant/bm25")

@@ -10,6 +10,8 @@ from codesense.models.state import CodeSenseState
 from codesense.agents.semantic_search import SemanticSearchAgent
 from codesense.agents.dependency_graph import DependencyGraphAgent
 from codesense.agents.explainer import ExplainerAgent
+from codesense.vector_store import VectorStore
+from codesense.graph_store import GraphStore
 
 class IntentClassification(BaseModel):
     intent: Literal["search", "impact", "explain", "refactor"] = Field(
@@ -25,20 +27,25 @@ class IntentClassification(BaseModel):
     )
 
 class SupervisorAgent:
-    def __init__(self, model_name: str = "qwen/qwen3.8-27b"):
+    def __init__(self, user_id: str = "default", model_name: str = "qwen/qwen3.8-27b"):
+        self.user_id = user_id
         self.llm = get_llm(
             purpose="fast",
             temperature=0,
             max_tokens=128,
         ).with_structured_output(IntentClassification)
         
-        # Initialize specialist tools
-        self.search_agent = SemanticSearchAgent()
-        self.graph_agent = DependencyGraphAgent()
+        # Initialize specialized isolated stores
+        self.vector_store = VectorStore(user_id=self.user_id)
+        self.graph_store = GraphStore(user_id=self.user_id)
+
+        # Initialize specialist tools with isolated stores
+        self.search_agent = SemanticSearchAgent(vector_store=self.vector_store)
+        self.graph_agent = DependencyGraphAgent(graph_store=self.graph_store)
         self.explainer_agent = ExplainerAgent(model_name=model_name)
         
         from codesense.agents.refactor import RefactorAgent
-        self.refactor_agent = RefactorAgent()  # Uses its own tool-calling model
+        self.refactor_agent = RefactorAgent(vector_store=self.vector_store)  # Uses its own tool-calling model
         
         # Build the graph
         self.graph = self._build_graph()
@@ -263,7 +270,7 @@ class SupervisorAgent:
         """Rebuild search and dependency indexes after a working-tree refactor."""
         repo_path = os.getenv("CODESENSE_REPO_PATH") or str(Path.cwd() / "repos" / "demo")
         try:
-            self.search_agent.vector_store.client.close()
+            # DO NOT close vector_store.client
             self.graph_agent.graph_store.close()
 
             from codesense.cli import refresh_indexes

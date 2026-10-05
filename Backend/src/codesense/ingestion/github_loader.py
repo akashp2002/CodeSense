@@ -24,13 +24,13 @@ def _remove_readonly(func, path, _):
     os.chmod(path, stat.S_IWRITE)
     func(path)
 
-def clone_repository(github_url: str) -> dict:
+def clone_repository(github_url: str, user_id: str = "default") -> dict:
     """
     Clone a GitHub repository into the local repos/ directory.
     Returns a dict with repo_name, local_path, and optionally changed_files.
     """
     repo_name = parse_github_url(github_url)
-    local_path = REPOS_DIR / repo_name
+    local_path = REPOS_DIR / str(user_id) / repo_name
     changed_files = None
 
     # If the repo already exists, update it instead of deleting (which fails due to DB locks)
