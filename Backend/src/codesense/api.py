@@ -270,7 +270,8 @@ def health_check():
 
     qdrant_client = None
     try:
-        qdrant_client = QdrantClient(path=str(DEFAULT_QDRANT_PATH))
+        from codesense.vector_store import _get_shared_client
+        qdrant_client = _get_shared_client()
         qdrant_client.get_collections()
         checks["qdrant"] = {"status": "ok", "path": str(DEFAULT_QDRANT_PATH)}
     except Exception as error:
@@ -322,6 +323,17 @@ def api_clone(request: CloneRequest, user: User = Depends(get_current_user)):
                 print(f"Index sync complete: {index_msg}")
             else:
                 print("Repository is up-to-date. Using cached indexes.")
+        else:
+            # Fresh clone, needs a full index
+            print("Fresh clone detected. Running full index...")
+            from codesense.cli import refresh_indexes
+            agent = get_supervisor(user.id)
+            refresh_indexes(
+                repo_path,
+                vector_store=agent.search_agent.vector_store,
+                graph_store=agent.graph_agent.graph_store
+            )
+            print("Full index complete.")
                 
         return result
     except Exception as e:
