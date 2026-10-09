@@ -1,5 +1,6 @@
 from codesense.mcp.server import rename_symbol
 from codesense.agents.supervisor import SupervisorAgent
+from codesense.agents.dependency_graph import DependencyGraphAgent
 
 
 def test_impact_target_ignores_action_words():
@@ -9,6 +10,47 @@ def test_impact_target_ignores_action_words():
     assert SupervisorAgent._normalize_impact_target(
         "changing", "changing database will affect what other files"
     ) == "database"
+
+
+def test_dependency_question_direction():
+    assert SupervisorAgent._dependency_direction("What depends on HybridRetriever?") == "dependents"
+    assert SupervisorAgent._dependency_direction("What does HybridRetriever depend on?") == "dependencies"
+    assert SupervisorAgent._dependency_direction("HybridRetriever's dependencies") == "dependencies"
+    assert SupervisorAgent._dependency_direction("HybridRetriever explain its usage?") is None
+
+
+def test_dependency_question_routes_to_impact_even_if_llm_says_explain():
+    class Classifier:
+        def invoke(self, _prompt):
+            return type("Result", (), {"intent": "explain", "extracted_symbol": None})()
+
+    agent = SupervisorAgent.__new__(SupervisorAgent)
+    agent.llm = Classifier()
+    state = {"question": "What does HybridRetriever depend on?"}
+
+    result = agent._classify_intent(state)
+
+    assert result["intent"] == "impact"
+    assert result["_dependency_direction"] == "dependencies"
+
+
+def test_dependency_graph_agent_uses_outbound_direction():
+    class GraphStore:
+        def get_dependencies(self, symbol_name, max_hops):
+            assert symbol_name == "HybridRetriever"
+            assert max_hops == 2
+            return [{"symbol_name": "EmbeddingModel", "file_path": "embeddings.py"}]
+
+        def get_dependents(self, _symbol_name, _max_hops):
+            raise AssertionError("outbound dependency query used incoming traversal")
+
+    result = DependencyGraphAgent(GraphStore()).get_impact(
+        "HybridRetriever", max_hops=2, direction="dependencies"
+    )
+
+    assert result["direction"] == "dependencies"
+    assert result["dependencies"] == [{"symbol_name": "EmbeddingModel", "file_path": "embeddings.py"}]
+    assert "EmbeddingModel" in result["summary"]
 
 
 def test_rename_symbol_changes_resolved_identifiers_only(tmp_path, monkeypatch):

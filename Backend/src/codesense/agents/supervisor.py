@@ -55,7 +55,9 @@ class SupervisorAgent:
         print(f"Supervisor: Analyzing intent for '{state['question']}'")
         try:
             result = self.llm.invoke(f"Classify the following codebase question: {state['question']}")
-            state["intent"] = result.intent
+            direction = self._dependency_direction(state["question"])
+            state["intent"] = "impact" if direction else result.intent
+            state["_dependency_direction"] = direction
             
             if result.intent == "impact" and result.extracted_symbol:
                 state["_target_symbol"] = result.extracted_symbol
@@ -64,7 +66,9 @@ class SupervisorAgent:
         except Exception as e:
             # Always try keyword fallback first — handles rate limits AND tool_use_failed
             intent, symbol = self._fallback_intent(state["question"])
-            state["intent"] = intent
+            direction = self._dependency_direction(state["question"])
+            state["intent"] = "impact" if direction else intent
+            state["_dependency_direction"] = direction
             if symbol:
                 state["_target_symbol"] = symbol
             print(
@@ -97,6 +101,26 @@ class SupervisorAgent:
         if any(t in q for t in search_terms):
             return "search", top_symbol
         return "explain", top_symbol
+
+    @staticmethod
+    def _dependency_direction(question: str) -> str | None:
+        """Return the requested edge direction for a dependency question."""
+        q = question.lower()
+        if not re.search(r"\bdepend(?:s|ed|ent|ents|ant|ants|enc(?:y|ies))?\b", q):
+            return None
+
+        if (
+            re.search(r"\b(?:what|which|who)\s+depend(?:s|ed)?\s+on\b", q)
+        ):
+            return "dependents"
+
+        if (
+            re.search(r"\bdepend(?:s|ed|ent)?\s+on\b", q)
+            or re.search(r"\bdependenc(?:y|ies)\s+(?:of|for)\b", q)
+            or re.search(r"\b[A-Za-z_][A-Za-z0-9_]*['’]s\s+dependenc(?:y|ies)\b", question, re.IGNORECASE)
+        ):
+            return "dependencies"
+        return "dependents"
 
     def _route(self, state: CodeSenseState) -> str:
         """Conditional router based on intent."""
@@ -136,7 +160,9 @@ class SupervisorAgent:
             
         print(f"Dependency Graph: Traversing graph for '{symbol}'...")
         
-        results = self.graph_agent.get_impact(symbol)
+        results = self.graph_agent.get_impact(
+            symbol, direction=state.get("_dependency_direction") or "dependents"
+        )
         state["impact_results"] = results
         return state
 
@@ -145,7 +171,9 @@ class SupervisorAgent:
         """Avoid generic classifier words becoming the dependency target."""
         generic = {
             "a", "affect", "change", "changing", "effect", "effected", "files",
-            "impact", "need", "other", "replace", "replacing", "what", "will",
+            "depend", "dependent", "dependents", "dependant", "dependants",
+            "dependencies", "dependency", "impact", "need", "other", "replace",
+            "replacing", "what", "will",
         }
         if extracted_symbol and extracted_symbol.lower() not in generic:
             return extracted_symbol
@@ -344,6 +372,7 @@ class SupervisorAgent:
             question=question,
             intent=None,
             _target_symbol=None,
+            _dependency_direction=None,
             search_results=None,
             impact_results=None,
             final_answer=None,

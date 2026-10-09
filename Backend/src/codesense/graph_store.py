@@ -132,6 +132,26 @@ class GraphStore:
             )
             return [dict(record) for record in result]
 
+    def get_dependencies(self, symbol_name: str, max_hops: int = 3) -> List[dict]:
+        """Find symbols that the requested symbol transitively depends on."""
+        with self.driver.session() as session:
+            result = session.run(
+                f"""
+                MATCH (source:Symbol)
+                WHERE source.tenant_id = $tenant_id AND source.symbol_name = $symbol_name
+                OPTIONAL MATCH (source)-[:CALLS|IMPORTS|INHERITS_FROM*1..{max_hops}]->(called:Symbol)
+                OPTIONAL MATCH (file:File {{tenant_id: $tenant_id, path: source.file_path}})-[:IMPORTS]->(imported:Symbol)
+                WITH collect(DISTINCT called) + collect(DISTINCT imported) AS targets
+                UNWIND targets AS target
+                RETURN DISTINCT target.symbol_name AS symbol_name,
+                    target.file_path AS file_path,
+                    labels(target) AS node_type
+                """,
+                tenant_id=self.user_id,
+                symbol_name=symbol_name
+            )
+            return [dict(record) for record in result]
+
     def get_callees(self, symbol_name: str) -> List[dict]:
         """
         Find all symbols that a given symbol depends on (outward edges).

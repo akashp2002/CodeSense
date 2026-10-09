@@ -7,6 +7,7 @@ class CodeSenseState(TypedDict):
     question: str
     intent: Optional[str]  # 'search', 'impact', 'explain', or 'refactor'
     _target_symbol: Optional[str]  # Symbol extracted by intent classifier for impact queries
+    _dependency_direction: Optional[str]
     search_results: Optional[List[Dict[str, Any]]]
     impact_results: Optional[Dict[str, Any]]
     final_answer: Optional[str]
