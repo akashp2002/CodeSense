@@ -5,7 +5,7 @@ from codesense.models.state import CodeSenseState
 
 class ExplainerAgent:
     def __init__(self, model_name: str = "openai/gpt-oss-20b"):
-        self.llm = get_llm(purpose="fast", temperature=0)
+        self.llm = get_llm(purpose="fast", temperature=0, max_tokens=1024)
         self.prompt = PromptTemplate(
             template="""You are an expert software engineer and technical communicator analyzing a codebase.
             
