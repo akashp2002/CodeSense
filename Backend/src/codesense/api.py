@@ -1,10 +1,11 @@
 import os
 import uvicorn
+import re
 from pathlib import Path
-from fastapi import FastAPI, HTTPException, status, Security, Depends
+from fastapi import FastAPI, HTTPException, status, Security, Depends, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordRequestForm
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 import secrets
 from typing import Optional
 from dotenv import load_dotenv
@@ -33,6 +34,14 @@ from codesense.ingestion.parser import SUPPORTED_EXTENSIONS
 from codesense.graph_store import GraphStore, NEO4J_URI
 from codesense.vector_store import DEFAULT_QDRANT_PATH
 from qdrant_client import QdrantClient
+from codesense.guardrails import (
+    GuardrailViolation,
+    contains_sensitive_data,
+    sanitize_data,
+    sanitize_output,
+    validate_repository_path,
+    validate_user_input,
+)
 
 from contextlib import asynccontextmanager
 
@@ -244,7 +253,7 @@ class DeleteRepositoryRequest(BaseModel):
     repo_path: str
 
 class QueryRequest(BaseModel):
-    question: str
+    question: str = Field(min_length=1, max_length=4_000)
 
 class QueryResponse(BaseModel):
     answer: str
@@ -252,8 +261,8 @@ class QueryResponse(BaseModel):
     diff_data: Optional[str] = None
 
 class CreatePRRequest(BaseModel):
-    prompt: str
-    repo_name: str
+    prompt: str = Field(min_length=1, max_length=4_000)
+    repo_name: str = Field(min_length=1, max_length=100)
 
 # ── Endpoints ──
 
@@ -502,8 +511,10 @@ async def websocket_query(websocket: WebSocket, token: Optional[str] = None):
     try:
         data = await websocket.receive_json()
         question = data.get("question")
-        if not question:
-            await websocket.send_json({"type": "error", "message": "No question provided"})
+        try:
+            question = validate_user_input(question)
+        except GuardrailViolation as error:
+            await websocket.send_json({"type": "error", "message": str(error)})
             return
             
         agent = get_supervisor(user_id)
@@ -562,11 +573,11 @@ async def websocket_query(websocket: WebSocket, token: Optional[str] = None):
         result_state = await async_stream()
         
         if result_state.get("error"):
-            await websocket.send_json({"type": "error", "message": result_state["error"]})
+            await websocket.send_json({"type": "error", "message": sanitize_output(result_state["error"])})
         else:
             await websocket.send_json({
                 "type": "result",
-                "answer": result_state.get("final_answer", "No answer generated."),
+                "answer": sanitize_output(result_state.get("final_answer", "No answer generated.")),
                 "plan": result_state.get("plan"),
                 "requires_approval": result_state.get("requires_approval", False),
                 "diff_data": result_state.get("diff_data")
@@ -578,40 +589,68 @@ async def websocket_query(websocket: WebSocket, token: Optional[str] = None):
         print(f"WS Error: {e}")
         traceback.print_exc()
         try:
-            await websocket.send_json({"type": "error", "message": str(e)})
+            await websocket.send_json({"type": "error", "message": sanitize_output(str(e))})
         except:
             pass
 
 @app.get("/search")
-def api_search(q: str, limit: int = 5, user: User = Depends(get_current_user)):
+def api_search(
+    q: str,
+    limit: int = Query(default=5, ge=1, le=20),
+    user: User = Depends(get_current_user),
+):
     """Semantic search across codebase."""
+    try:
+        q = validate_user_input(q)
+    except GuardrailViolation as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
     agent = get_supervisor(user.id).search_agent
     results = agent.search_codebase(q, limit=limit)
-    return {"results": results}
+    return sanitize_data({"results": results})
 
 @app.get("/impact/{symbol}")
-def api_impact(symbol: str, hops: int = 3, user: User = Depends(get_current_user)):
+def api_impact(
+    symbol: str,
+    hops: int = Query(default=3, ge=1, le=5),
+    user: User = Depends(get_current_user),
+):
     """Dependency impact analysis for a symbol."""
+    try:
+        symbol = validate_user_input(symbol)
+    except GuardrailViolation as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
     agent = get_supervisor(user.id).graph_agent
     results = agent.get_impact(symbol, max_hops=hops)
-    return results
+    return sanitize_data(results)
 
 @app.get("/graph/{symbol}")
-def api_graph_neighborhood(symbol: str, hops: int = 2, user: User = Depends(get_current_user)):
+def api_graph_neighborhood(
+    symbol: str,
+    hops: int = Query(default=2, ge=1, le=5),
+    user: User = Depends(get_current_user),
+):
     """Get raw graph nodes and edges for visualization."""
+    try:
+        symbol = validate_user_input(symbol)
+    except GuardrailViolation as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
     store = get_supervisor(user.id).graph_agent.graph_store
-    return store.get_neighborhood(symbol, max_hops=hops)
+    return sanitize_data(store.get_neighborhood(symbol, max_hops=hops))
 
 @app.post("/query", response_model=QueryResponse)
 def api_query(request: QueryRequest, user: User = Depends(get_current_user)):
     """Natural language Q&A using the LangGraph Supervisor."""
+    try:
+        question = validate_user_input(request.question)
+    except GuardrailViolation as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
     agent = get_supervisor(user.id)
     try:
-        result_state = agent.run(request.question)
+        result_state = agent.run(question)
         if "error" in result_state and result_state["error"]:
             raise HTTPException(status_code=500, detail=result_state["error"])
             
-        answer = result_state.get("final_answer", "No answer generated.")
+        answer = sanitize_output(result_state.get("final_answer", "No answer generated."))
         
         return {
             "answer": answer,
@@ -625,7 +664,7 @@ def api_query(request: QueryRequest, user: User = Depends(get_current_user)):
         print(f"{'='*60}")
         traceback.print_exc()
         print(f"{'='*60}\n")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=sanitize_output(str(e))) from e
 
 @app.post("/create-pr")
 def api_create_pr(request: CreatePRRequest, user: User = Depends(get_current_user)):
@@ -642,10 +681,18 @@ def api_create_pr(request: CreatePRRequest, user: User = Depends(get_current_use
             pass
     
     try:
-        repo_path = str(Path("repos") / str(user.id) / request.repo_name)
+        if not re.fullmatch(r"[A-Za-z0-9_.-]{1,100}", request.repo_name) or request.repo_name in {".", ".."}:
+            raise HTTPException(status_code=422, detail="Invalid repository name.")
+        if not request.prompt.strip() or len(request.prompt) > 4_000:
+            raise HTTPException(status_code=422, detail="PR description must contain 1 to 4,000 characters.")
+        if contains_sensitive_data(request.prompt):
+            raise HTTPException(status_code=422, detail="PR description cannot contain credential-like values.")
 
-        staging_path = repo_path + "_staging"
-        if not os.path.exists(staging_path):
+        user_repos = (Path("repos") / str(user.id)).resolve()
+        repo_path = validate_repository_path(user_repos, request.repo_name)
+        staging_path = validate_repository_path(user_repos, f"{request.repo_name}_staging")
+
+        if not staging_path.is_dir() or not repo_path.is_dir():
             raise HTTPException(status_code=400, detail="Staging sandbox not found. Cannot approve.")
 
         agent = get_supervisor(user.id)
@@ -653,26 +700,42 @@ def api_create_pr(request: CreatePRRequest, user: User = Depends(get_current_use
         # Step 1: Find which files changed in the staging sandbox
         changed_files = subprocess.run(
             ["git", "diff", "--name-only"],
-            cwd=staging_path, capture_output=True, text=True
+            cwd=str(staging_path), capture_output=True, text=True, check=True
         ).stdout.strip().splitlines()
         changed_files = [f for f in changed_files if f.strip()]
+        if not changed_files:
+            raise HTTPException(status_code=400, detail="There are no staged changes to approve.")
+        proposed_diff = subprocess.run(
+            ["git", "--no-pager", "diff", "--no-ext-diff"],
+            cwd=str(staging_path),
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+        if len(proposed_diff) > 50_000 or contains_sensitive_data(proposed_diff):
+            raise HTTPException(
+                status_code=422,
+                detail="The proposed changes exceed the safe output limit or contain credential-like values.",
+            )
         
         # Step 2: Copy changed files from staging back to main repo
         for rel_path in changed_files:
-            src = os.path.join(staging_path, rel_path)
-            dst = os.path.join(repo_path, rel_path)
+            src = validate_repository_path(staging_path, rel_path)
+            dst = validate_repository_path(repo_path, rel_path)
             if os.path.exists(src):
-                os.makedirs(os.path.dirname(dst), exist_ok=True)
+                if not src.is_file():
+                    raise HTTPException(status_code=400, detail="Only regular files can be approved.")
+                dst.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(src, dst)
         
         # Step 3: Create the PR directly from the main repo (it now has the changes)
-        pull_request_url = create_pull_request(repo_path, request.prompt)
+        pull_request_url = create_pull_request(str(repo_path), request.prompt)
         
         # Step 4: Incrementally refresh indexes using the KNOWN changed files
         # (must pass explicitly because git diff returns empty after commit)
         from codesense.cli import incremental_refresh_indexes
         index_status = incremental_refresh_indexes(
-            repo_path,
+            str(repo_path),
             vector_store=agent.search_agent.vector_store,
             graph_store=agent.graph_agent.graph_store,
             changed_files=changed_files
@@ -685,7 +748,7 @@ def api_create_pr(request: CreatePRRequest, user: User = Depends(get_current_use
         # Update the last-indexed commit so startup sync skips next time
         try:
             import subprocess as _sp
-            new_head = _sp.run(["git", "rev-parse", "HEAD"], cwd=repo_path,
+            new_head = _sp.run(["git", "rev-parse", "HEAD"], cwd=str(repo_path),
                                capture_output=True, text=True, check=False).stdout.strip()
             if new_head:
                 _LAST_COMMIT_FILE.write_text(new_head)

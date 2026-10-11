@@ -119,6 +119,12 @@ The user must explicitly select:
 Approve & Create PR
 ```
 
+### Runtime Guardrails
+
+CodeSense validates chat and semantic-search input before processing, rejects common attempts to override system instructions, and limits queries to 4,000 characters. Retrieved repository content is treated as untrusted data. Responses are length-limited and credential-like values are redacted; proposed diffs containing sensitive values or exceeding 50,000 characters are blocked from approval.
+
+Refactor tools use a phase-specific allowlist and a six-call budget. Tool file access is confined to the selected repository, excludes credential and Git metadata files, limits files to 1 MB, and bounds bulk replacements. Branch, commit, push, and pull-request tools are unavailable unless the agent is explicitly started in the push phase with human approval.
+
 before GitHub operations occur.
 
 ---

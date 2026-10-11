@@ -7,6 +7,14 @@ from pydantic import BaseModel, Field
 from codesense.llm_manager import get_llm
 from langgraph.graph import StateGraph, START, END
 from codesense.models.state import CodeSenseState
+from codesense.guardrails import (
+    MAX_ANSWER_CHARS,
+    MAX_DIFF_CHARS,
+    GuardrailViolation,
+    contains_sensitive_data,
+    sanitize_output,
+    validate_user_input,
+)
 from codesense.agents.semantic_search import SemanticSearchAgent
 from codesense.agents.dependency_graph import DependencyGraphAgent
 from codesense.agents.explainer import ExplainerAgent
@@ -49,6 +57,38 @@ class SupervisorAgent:
         
         # Build the graph
         self.graph = self._build_graph()
+
+    @staticmethod
+    def _validate_input(state: CodeSenseState) -> CodeSenseState:
+        try:
+            state["question"] = validate_user_input(state.get("question"))
+        except GuardrailViolation as error:
+            state["error"] = str(error)
+        return state
+
+    @staticmethod
+    def _route_after_input(state: CodeSenseState) -> str:
+        return END if state.get("error") else "supervisor"
+
+    @staticmethod
+    def _apply_output_guardrails(state: CodeSenseState) -> CodeSenseState:
+        answer = state.get("final_answer")
+        if answer:
+            state["final_answer"] = sanitize_output(answer, MAX_ANSWER_CHARS)
+
+        diff = state.get("diff_data")
+        if diff:
+            sanitized_diff = sanitize_output(diff, MAX_DIFF_CHARS)
+            if len(diff) > MAX_DIFF_CHARS or contains_sensitive_data(diff) or sanitized_diff != diff:
+                state["diff_data"] = None
+                state["requires_approval"] = False
+                state["error"] = (
+                    "The proposed changes exceed the safe output limit or contain sensitive data. "
+                    "No changes are available for approval."
+                )
+            else:
+                state["diff_data"] = sanitized_diff
+        return state
 
     def _classify_intent(self, state: CodeSenseState) -> CodeSenseState:
         """Node 1: Classify the user's intent."""
@@ -321,14 +361,21 @@ class SupervisorAgent:
         workflow = StateGraph(CodeSenseState)
 
         # Add nodes
+        workflow.add_node("input_guardrail", self._validate_input)
         workflow.add_node("supervisor", self._classify_intent)
         workflow.add_node("semantic_search", self._run_semantic_search)
         workflow.add_node("dependency_graph", self._run_dependency_graph)
         workflow.add_node("explainer", self.explainer_agent.generate_explanation)
         workflow.add_node("refactor_node", self._refactor_node)
+        workflow.add_node("output_guardrail", self._apply_output_guardrails)
 
         # Edges
-        workflow.add_edge(START, "supervisor")
+        workflow.add_edge(START, "input_guardrail")
+        workflow.add_conditional_edges(
+            "input_guardrail",
+            self._route_after_input,
+            {"supervisor": "supervisor", END: END},
+        )
         
         # Router from supervisor
         workflow.add_conditional_edges(
@@ -356,15 +403,21 @@ class SupervisorAgent:
         workflow.add_edge("dependency_graph", "explainer")
         
         # After refactor, we're done (UI shows approval)
-        workflow.add_edge("refactor_node", END)
+        workflow.add_edge("refactor_node", "output_guardrail")
         
         # After explainer, we're done
-        workflow.add_edge("explainer", END)
+        workflow.add_edge("explainer", "output_guardrail")
+        workflow.add_edge("output_guardrail", END)
 
         return workflow.compile()
 
     def run(self, question: str) -> dict:
         """Execute the LangGraph workflow for a given question and return the state dict."""
+        try:
+            question = validate_user_input(question)
+        except GuardrailViolation as error:
+            return {"error": str(error)}
+
         if not os.getenv("GROQ_API_KEY"):
             return {"error": "Error: GROQ_API_KEY environment variable is missing. Please set it in your .env file."}
             

@@ -1,15 +1,35 @@
 from mcp.server.fastmcp import FastMCP
 import os
+import re
 import subprocess
 import sys
+from functools import wraps
 from pathlib import Path
 from github import Github
 from github import Auth
 import tree_sitter_python as tspython
 from tree_sitter import Language, Parser
+from codesense.guardrails import (
+    GuardrailViolation,
+    authorize_tool_call,
+    sanitize_output,
+    validate_repository_path,
+)
 
 # Create a FastMCP server
 mcp = FastMCP("CodeSense-Refactor-Tools")
+MAX_TOOL_FILE_BYTES = 1_000_000
+MAX_TOOL_TEXT_CHARS = 50_000
+
+
+def guarded_tool(function):
+    @wraps(function)
+    def guarded(*args, **kwargs):
+        authorize_tool_call(function.__name__)
+        result = function(*args, **kwargs)
+        return sanitize_output(result, MAX_TOOL_TEXT_CHARS) if isinstance(result, str) else result
+
+    return guarded
 
 def get_repo_path() -> Path:
     """Helper to get the current loaded repository path."""
@@ -19,9 +39,8 @@ def get_repo_path() -> Path:
     else:
         base_dir = Path(os.getcwd())
         repo_dir = base_dir / "repos" / "demo"
-    if not repo_dir.exists():
-        # Fallback to current directory for testing
-        return Path(os.getcwd())
+    if not repo_dir.is_dir():
+        raise GuardrailViolation("No valid repository is configured for tool execution.")
     return repo_dir
 
 
@@ -203,10 +222,11 @@ def _validate_python_file(file_path: Path, repo_path: Path) -> str:
     return diff_result.stdout.strip() or diff_result.stderr.strip()
 
 @mcp.tool()
+@guarded_tool
 def list_files(directory: str = "") -> str:
     """List all Python files in the repository (or a subdirectory)."""
     repo_path = get_repo_path()
-    target = repo_path / directory
+    target = _get_safe_path(repo_path, directory)
     try:
         files = sorted(str(f.relative_to(repo_path)) for f in target.rglob("*.py")
                        if ".venv" not in str(f) and "__pycache__" not in str(f))
@@ -215,10 +235,13 @@ def list_files(directory: str = "") -> str:
         return f"Error listing files: {e}"
 
 @mcp.tool()
+@guarded_tool
 def search_file(query: str, path: str = "") -> str:
     """Search for a string (e.g. function name) across all Python files in the repository."""
+    if not query or len(query) > 500:
+        raise GuardrailViolation("Search queries must contain 1 to 500 characters.")
     repo_path = get_repo_path()
-    target = repo_path / path
+    target = _get_safe_path(repo_path, path)
     matches = []
     try:
         for root, _, files in os.walk(target):
@@ -229,6 +252,10 @@ def search_file(query: str, path: str = "") -> str:
                 if not any(file.endswith(ext) for ext in supported):
                     continue
                 file_path = os.path.join(root, file)
+                try:
+                    file_path = _get_safe_path(repo_path, file_path)
+                except GuardrailViolation:
+                    continue
                 try:
                     with open(file_path, "r", encoding="utf-8") as f:
                         for i, line in enumerate(f, 1):
@@ -246,17 +273,17 @@ def search_file(query: str, path: str = "") -> str:
         return f"Error searching: {e}"
 
 def _get_safe_path(repo_path: Path, file_path: str) -> Path:
-    p = Path(file_path)
-    if p.is_absolute():
-        return p.resolve()
-    return (repo_path / p).resolve()
+    return validate_repository_path(repo_path, file_path)
 
 @mcp.tool()
+@guarded_tool
 def read_file(file_path: str) -> str:
     """Read the contents of a file in the repository, with line numbers included."""
     repo_path = get_repo_path()
     full_path = _get_safe_path(repo_path, file_path)
     try:
+        if full_path.stat().st_size > MAX_TOOL_FILE_BYTES:
+            raise GuardrailViolation("The requested file exceeds the 1 MB tool-read limit.")
         with open(full_path, "r", encoding="utf-8") as f:
             lines = f.readlines()
             return "\n".join(f"{i+1:4d} | {line.rstrip()}" for i, line in enumerate(lines))
@@ -264,6 +291,7 @@ def read_file(file_path: str) -> str:
         return f"Error reading file: {e}"
 
 @mcp.tool()
+@guarded_tool
 def replace_in_file(file_path: str, search_string: str, replacement_string: str) -> str:
     """Replace an exact string in a file with a new string.
     
@@ -272,18 +300,29 @@ def replace_in_file(file_path: str, search_string: str, replacement_string: str)
     """
     repo_path = get_repo_path()
     full_path = _get_safe_path(repo_path, file_path)
+    if not search_string or len(search_string) > MAX_TOOL_TEXT_CHARS:
+        raise GuardrailViolation("Search text must contain 1 to 50,000 characters.")
+    if len(replacement_string) > MAX_TOOL_TEXT_CHARS:
+        raise GuardrailViolation("Replacement text cannot exceed 50,000 characters.")
     try:
+        if full_path.stat().st_size > MAX_TOOL_FILE_BYTES:
+            raise GuardrailViolation("The target file exceeds the 1 MB edit limit.")
         content = full_path.read_text(encoding="utf-8")
         if search_string not in content:
             return f"Error: '{search_string}' not found in {file_path}."
         
+        if content.count(search_string) > 25:
+            raise GuardrailViolation("The edit matches more than 25 locations; narrow the search text.")
         updated_content = content.replace(search_string, replacement_string)
+        if len(updated_content.encode("utf-8")) > MAX_TOOL_FILE_BYTES:
+            raise GuardrailViolation("The edited file would exceed the 1 MB tool limit.")
         full_path.write_text(updated_content, encoding="utf-8")
         return f"Successfully replaced occurrences in {file_path}."
     except Exception as e:
         return f"Error replacing in file: {e}"
 
 @mcp.tool()
+@guarded_tool
 def rename_symbol(file_path: str, old_name: str, new_name: str) -> str:
     """Rename a Python function or class and its resolved imports across the repository."""
     if not old_name.isidentifier() or not new_name.isidentifier():
@@ -303,6 +342,8 @@ def rename_symbol(file_path: str, old_name: str, new_name: str) -> str:
         return "Error: file_path must be a Python file."
 
     try:
+        if full_path.stat().st_size > MAX_TOOL_FILE_BYTES:
+            raise GuardrailViolation("The target file exceeds the 1 MB rename limit.")
         original = full_path.read_bytes()
         _, replacements, definition_count = _rename_identifier_nodes(original, old_name, new_name)
         if definition_count == 0:
@@ -311,11 +352,16 @@ def rename_symbol(file_path: str, old_name: str, new_name: str) -> str:
             return f"Error: '{old_name}' has {definition_count} definitions in {file_path}; rename is ambiguous."
         if not replacements:
             return f"Error: no references resolved for '{old_name}' in {file_path}."
-
         changes = {full_path: (original, _apply_replacements(original, replacements, new_name), len(replacements))}
         module_names = _module_names_for_file(repo_path, full_path)
         for candidate in repo_path.rglob("*.py"):
             if candidate == full_path or any(part in {".venv", "__pycache__", ".git"} for part in candidate.parts):
+                continue
+            try:
+                candidate = validate_repository_path(repo_path, candidate)
+                if candidate.stat().st_size > MAX_TOOL_FILE_BYTES:
+                    continue
+            except (GuardrailViolation, OSError):
                 continue
             candidate_source = candidate.read_bytes()
             candidate_replacements = _import_reference_replacements(
@@ -349,34 +395,28 @@ def rename_symbol(file_path: str, old_name: str, new_name: str) -> str:
         return f"Error renaming symbol: {e}"
 
 @mcp.tool()
+@guarded_tool
 def get_git_diff() -> str:
     """Get the git diff of the current repository."""
     repo_path = get_repo_path()
-    import tempfile
     try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".txt") as f:
-            temp_name = f.name
-            
-        subprocess.run(
-            f'git --no-pager diff > "{temp_name}" 2>&1',
+        result = subprocess.run(
+            ["git", "--no-pager", "diff"],
             cwd=str(repo_path),
-            shell=True,
+            capture_output=True,
+            text=True,
             check=True
         )
-        
-        with open(temp_name, "r", encoding="utf-8") as f:
-            output = f.read().strip()
-            
-        return output if output else "No changes."
+        return result.stdout.strip() if result.stdout.strip() else "No changes."
     except Exception as e:
         return f"Error getting git diff: {e}"
-    finally:
-        if os.path.exists(temp_name):
-            os.remove(temp_name)
 
 @mcp.tool()
+@guarded_tool
 def create_branch(branch_name: str) -> str:
     """Create and checkout a new git branch."""
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,99}", branch_name) or ".." in branch_name:
+        raise GuardrailViolation("Invalid branch name.")
     repo_path = get_repo_path()
     try:
         subprocess.run(["git", "--no-pager", "checkout", "-b", branch_name], cwd=str(repo_path), stdin=subprocess.DEVNULL, capture_output=True, text=True, check=True)
@@ -385,8 +425,11 @@ def create_branch(branch_name: str) -> str:
         return f"Error creating branch: {e.stderr}"
 
 @mcp.tool()
+@guarded_tool
 def commit_changes(commit_message: str) -> str:
     """Stage all changes and commit them."""
+    if not commit_message.strip() or len(commit_message) > 200:
+        raise GuardrailViolation("Commit messages must contain 1 to 200 characters.")
     repo_path = get_repo_path()
     try:
         subprocess.run(["git", "--no-pager", "add", "."], cwd=str(repo_path), stdin=subprocess.DEVNULL, capture_output=True, text=True, check=True)
@@ -396,8 +439,11 @@ def commit_changes(commit_message: str) -> str:
         return f"Error committing changes: {e.stderr}"
 
 @mcp.tool()
+@guarded_tool
 def push_branch(branch_name: str) -> str:
     """Push the current branch to origin."""
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,99}", branch_name) or ".." in branch_name:
+        raise GuardrailViolation("Invalid branch name.")
     repo_path = get_repo_path()
     try:
         subprocess.run(["git", "--no-pager", "push", "-u", "origin", branch_name], cwd=str(repo_path), stdin=subprocess.DEVNULL, capture_output=True, text=True, check=True)
@@ -406,8 +452,18 @@ def push_branch(branch_name: str) -> str:
         return f"Error pushing branch: {e.stderr}"
 
 @mcp.tool()
+@guarded_tool
 def create_pull_request(repo_name: str, title: str, head_branch: str, base_branch: str, body: str) -> str:
     """Create a pull request on GitHub using PyGithub."""
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo_name):
+        raise GuardrailViolation("Repository names must use the owner/repository format.")
+    if not title.strip() or len(title) > 200 or len(body) > MAX_TOOL_TEXT_CHARS:
+        raise GuardrailViolation("PR title or body is empty or exceeds its size limit.")
+    if any(
+        not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,99}", branch) or ".." in branch
+        for branch in (head_branch, base_branch)
+    ):
+        raise GuardrailViolation("Invalid PR branch name.")
     token = os.getenv("GITHUB_TOKEN")
     if not token:
         return "Error: GITHUB_TOKEN environment variable not set."
