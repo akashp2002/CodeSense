@@ -1,6 +1,7 @@
 import os
 import re
 import threading
+import unicodedata
 from pathlib import Path
 from typing import Any
 
@@ -28,22 +29,57 @@ TOOL_ALLOWLIST = {
     },
 }
 
+_HOMOGLYPH_MAP = {
+    'а': 'a', 'е': 'e', 'і': 'i', 'ο': 'o', 'р': 'p', 'с': 'c', 'х': 'x',
+    'у': 'y', 'һ': 'h', 'Α': 'A', 'Β': 'B', 'Ε': 'E', 'Η': 'H', 'Ι': 'I',
+    'Κ': 'K', 'Ο': 'O', 'Ρ': 'P', 'Τ': 'T', 'Χ': 'X', 'Υ': 'Y',
+}
+
+
+def _normalize_for_guardrails(value: str) -> str:
+    normalized = unicodedata.normalize("NFKC", value)
+    for source, replacement in _HOMOGLYPH_MAP.items():
+        normalized = normalized.replace(source, replacement)
+    normalized = normalized.casefold()
+    normalized = normalized.replace("```", " ")
+    normalized = normalized.replace("\u200b", "").replace("\u200c", "").replace("\u200d", "")
+    normalized = normalized.replace("\ufeff", "")
+    normalized = re.sub(r"[\s\-_`~]+", " ", normalized)
+    return normalized.strip()
+
+
 _INPUT_OVERRIDE_PATTERNS = (
-    re.compile(r"\bignore\s+(?:all\s+)?(?:previous|prior|system)\s+instructions\b", re.I),
-    re.compile(r"\b(?:reveal|show|print|repeat)\s+(?:the\s+)?system\s+prompt\b", re.I),
-    re.compile(r"\b(?:bypass|disable|skip)\s+(?:the\s+)?(?:guardrails?|safety|approval)\b", re.I),
+    re.compile(r"\b(?:ignore|disregard|forget|override)\s+(?:all\s+)?(?:previous|prior|system|developer|hidden|initial)\s+(?:instru(?:ction|ctions)|prompt|rules?|safeguards?)\b"),
+    re.compile(r"\b(?:reveal|show|print|repeat|display|echo|expose)\s+(?:the\s+)?(?:system|developer|hidden|internal)\s+(?:prompt|instructions?|message)\b"),
+    re.compile(r"\b(?:bypass|disable|skip|override|remove|silence)\s+(?:the\s+)?(?:guardrails?|safety|approval|policy|checks?)\b"),
+    re.compile(r"\b(?:pretend|act)\s+(?:you\s+are|as)\s+(?:the\s+)?(?:developer|system|admin|owner|operator)\b"),
+    re.compile(r"\b(?:developer|system)\s+(?:override|directive|instruction|prompt)\b"),
+    re.compile(r"\b(?:ignore|disregard|forget)\s+(?:all|any|previous|prior|system|developer)\s+(?:meta|hidden|internal)?\s*(?:instructions?|rules?|prompts?)\b"),
+    re.compile(r"\b(?:you\s+are\s+now|from\s+now\s+on|for\s+all\s+future\s+requests)\b.*\b(?:ignore|override|disregard|forget)\b"),
 )
 _SECRET_PATTERNS = (
     re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,})\b"),
     re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
-    re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]{16,}"),
+    re.compile(r"\b(?:ASIA|A3T|AGPA|AIDA|AROA|AIPA|ANPA|ANVA|AWS)[A-Z0-9]{12,}\b"),
+    re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]{16,}\b"),
+    re.compile(r"(?i)\b(?:jwt|token)\s*[:=]\s*['\"]?eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9._~+/=-]+['\"]?"),
+    re.compile(r"(?i)\b(?:session|refresh|auth|access)[_-]?(?:id|token|cookie)\b\s*[:=]\s*['\"]?[A-Za-z0-9._~+/=-]{16,}['\"]?"),
+    re.compile(r"(?i)\b(?:refresh[_-]?token|refresh_token|rt)\b\s*[:=]\s*['\"]?[A-Za-z0-9._~+/=-]{16,}['\"]?"),
+    re.compile(r"(?i)\b(?:aws_session_token|session_token|aws_sessiontoken)\b\s*[:=]\s*['\"]?[A-Za-z0-9/+=]{16,}['\"]?"),
     re.compile(
-        r"(?i)\b(api[_-]?key|secret[_-]?key|access[_-]?token|password)\b"
+        r"(?i)\b(api[_-]?key|secret[_-]?key|access[_-]?token|refresh[_-]?token|password|session[_-]?cookie)\b"
         r"(\s*[:=]\s*)(['\"]?)[A-Za-z0-9_./+=:-]{8,}\3"
     ),
+    re.compile(r"(?i)(?:https?://[^\s\"'<>]*?(?:token|api[_-]?key|secret|password|access[_-]?token|refresh[_-]?token|session)[^\s\"'<>]*=[A-Za-z0-9._~+/%=-]{8,})"),
+    re.compile(r"(?i)(?:\b(?:token|api[_-]?key|secret|password|access[_-]?token|refresh[_-]?token|session)[A-Za-z0-9_-]*\s*[:=]\s*['\"]?[A-Za-z0-9._~+/=-]{8,}['\"]?)"),
+    re.compile(r"(?i)\b(?:xox[baprs]-[A-Za-z0-9-]{10,}|sk_live_[A-Za-z0-9+/=]{16,}|sk-[A-Za-z0-9]{20,}|AIza[0-9A-Za-z_-]{35})\b"),
     re.compile(
-        r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----.*?"
-        r"-----END (?:RSA |EC |OPENSSH )?PRIVATE KEY-----",
+        r"-----BEGIN (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----.*?"
+        r"-----END (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----",
+        re.S,
+    ),
+    re.compile(
+        r"-----BEGIN OPENSSH PRIVATE KEY-----.*?-----END OPENSSH PRIVATE KEY-----",
         re.S,
     ),
 )
@@ -86,7 +122,18 @@ def validate_user_input(value: str) -> str:
         raise GuardrailViolation(f"Queries cannot exceed {MAX_INPUT_CHARS} characters.")
     if any(ord(character) < 32 and character not in "\n\r\t" for character in question):
         raise GuardrailViolation("The query contains unsupported control characters.")
-    if any(pattern.search(question) for pattern in _INPUT_OVERRIDE_PATTERNS):
+
+    normalized_question = _normalize_for_guardrails(question)
+    if any(pattern.search(normalized_question) for pattern in _INPUT_OVERRIDE_PATTERNS):
+        raise GuardrailViolation("The query appears to request bypassing system instructions or safeguards.")
+
+    if (
+        any(word in normalized_question for word in ("ignore", "disregard", "forget"))
+        and any(token in normalized_question for token in ("instruction", "prompt", "system", "developer", "safety", "guardrail"))
+    ) or (
+        any(word in normalized_question for word in ("pretend", "act"))
+        and any(token in normalized_question for token in ("developer", "system", "admin", "owner"))
+    ):
         raise GuardrailViolation("The query appears to request bypassing system instructions or safeguards.")
     return question
 
