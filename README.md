@@ -45,7 +45,7 @@ CodeSense builds a dependency graph of the repository using **Neo4j**.
 You can ask:
 
 ```text
-What would be affected if I change get_db?
+What would be affected if I change get_db_session?
 ```
 
 The system can identify dependent files and symbols.
@@ -53,7 +53,7 @@ The system can identify dependent files and symbols.
 Example:
 
 ```text
-Changing 'get_db' may impact 3 reference(s)
+Changing 'get_db_session' may impact 3 reference(s)
 across 3 files:
 
 - backend/app/core/security.py
@@ -287,7 +287,7 @@ Neo4j
 This allows CodeSense to answer questions such as:
 
 ```text
-What depends on get_db?
+What depends on get_db_session?
 ```
 
 ---
@@ -425,19 +425,19 @@ get_impact(symbol_name)
 For example:
 
 ```text
-get_impact("get_db")
+get_impact("get_db_session")
 ```
 
-The graph store searches for symbols that depend on `get_db`.
+The graph store searches for symbols that depend on `get_db_session`.
 
 The agent returns information such as:
 
 ```json
 {
-    "target_symbol": "get_db",
+    "target_symbol": "get_db_session",
     "dependent_count": 3,
     "dependents": [...],
-    "summary": "Changing 'get_db' may impact 3 reference(s)..."
+    "summary": "Changing 'get_db_session' may impact 3 reference(s)..."
 }
 ```
 
@@ -1381,7 +1381,7 @@ Explain how resume parsing works.
 ### Impact Analysis
 
 ```text
-What would be affected if I change get_db?
+What would be affected if I change get_db_session?
 ```
 
 ---
@@ -1772,7 +1772,7 @@ Create PR
 the developer can communicate naturally:
 
 ```text
-"What would be affected if I change get_db?"
+"What would be affected if I change get_db_session?"
 
 "Rename clean_text to preprocess_text."
 ```

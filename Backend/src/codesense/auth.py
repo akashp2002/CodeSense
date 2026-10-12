@@ -7,7 +7,7 @@ import jwt
 import bcrypt
 from sqlalchemy.orm import Session
 from sqlalchemy.orm import Session
-from codesense.database import get_db, User
+from codesense.database import get_db_session, User
 
 # Security constants
 SECRET_KEY = os.getenv("JWT_SECRET_KEY", "codesense_super_secret_development_key")
@@ -40,7 +40,7 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
     encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
     return encoded_jwt
 
-async def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)):
+async def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db_session)):
     credentials_exception = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail="Could not validate credentials",
@@ -63,7 +63,7 @@ async def get_current_user(token: str = Depends(oauth2_scheme), db: Session = De
         raise credentials_exception
     return user
 
-async def get_current_user_or_guest(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)):
+async def get_current_user_or_guest(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db_session)):
     """Like get_current_user but returns None if no token is provided (allows public access)"""
     if not token:
         return None

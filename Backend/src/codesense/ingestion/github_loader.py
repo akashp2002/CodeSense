@@ -151,12 +151,8 @@ def create_pull_request(local_path: str, prompt: str) -> str:
     github_repo = github.get_repo(github_repo_name)
     base_branch = github_repo.default_branch
 
-    current_branch = repo.active_branch.name
-    if current_branch.startswith("codesense/refactor-"):
-        branch_name = current_branch
-    else:
-        branch_name = f"codesense/refactor-{uuid.uuid4().hex[:8]}"
-        repo.git.checkout("-b", branch_name)
+    branch_name = f"codesense/refactor-{uuid.uuid4().hex[:12]}"
+    repo.git.checkout("-b", branch_name)
 
     if repo.is_dirty(untracked_files=True):
         repo.git.add(A=True)

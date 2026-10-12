@@ -20,7 +20,10 @@ class DependencyGraphAgent:
 
         if not related:
             if relation_name == "dependents":
-                summary = f"No dependents found for '{symbol_name}'. It is safe to change."
+                summary = (
+                    f"No dependents were found for '{symbol_name}' in the indexed graph. "
+                    "The graph result is inconclusive."
+                )
             else:
                 summary = f"No dependencies found for '{symbol_name}'."
         else:

@@ -1,5 +1,6 @@
 import sys
 import os
+import re
 import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
@@ -22,7 +23,44 @@ class RefactorAgent:
         self.llm = get_llm(purpose="coding", temperature=0, max_tokens=512)
         self.timeout_seconds = 120
 
-    async def run(self, prompt: str, phase: str = "refactor", approved: bool = False) -> str:
+    @staticmethod
+    def _requested_symbol_rename(prompt: str) -> tuple[str, str] | None:
+        request = prompt.partition("User Request:")[2] or prompt
+        match = re.search(
+            r"\brename\s+(?:the\s+)?(?:function|class|symbol)?\s*"
+            r"([A-Za-z_]\w*)\s+(?:to|as)\s+([A-Za-z_]\w*)\b",
+            request,
+            re.IGNORECASE,
+        )
+        return (match.group(1), match.group(2)) if match else None
+
+    @staticmethod
+    def _definition_file(prompt: str, symbol: str) -> str | None:
+        context = prompt.partition("User Request:")[0]
+        file_pattern = re.compile(
+            r"- File: `([^`]+)` \(Lines [^)]+\)\s*```[^\n]*\n(.*?)\n```",
+            re.DOTALL,
+        )
+        definition_pattern = re.compile(
+            rf"(?m)^\s*(?:async\s+)?def\s+{re.escape(symbol)}\s*\(|"
+            rf"^\s*class\s+{re.escape(symbol)}\b"
+        )
+        for match in file_pattern.finditer(context):
+            if definition_pattern.search(match.group(2)):
+                return match.group(1)
+        return None
+
+    @staticmethod
+    def _rename_file_path(prompt: str, symbol: str) -> str:
+        return RefactorAgent._definition_file(prompt, symbol) or "."
+
+    async def run(
+        self,
+        prompt: str,
+        phase: str = "refactor",
+        approved: bool = False,
+        repository_path: str | None = None,
+    ) -> str:
         """
         Run the refactor agent in the specified phase using MCP tools.
         phase: "refactor" (applies changes and generates diff) or "push" (creates branch and PR)
@@ -37,6 +75,7 @@ class RefactorAgent:
             args=["-m", "codesense.mcp.server"],
             env={
                 **os.environ,
+                **({"CODESENSE_REPO_PATH": repository_path} if repository_path else {}),
                 "CODESENSE_TOOL_PHASE": phase,
                 "CODESENSE_TOOL_APPROVED": "1" if approved else "0",
             },
@@ -52,6 +91,25 @@ class RefactorAgent:
                 if phase == "refactor":
                     allowed = {"rename_symbol", "replace_in_file", "read_file"}
                     tools = [t for t in all_tools if t.name in allowed]
+
+                    requested_rename = self._requested_symbol_rename(prompt)
+                    if requested_rename:
+                        old_name, new_name = requested_rename
+                        file_path = self._rename_file_path(prompt, old_name)
+                        rename_tool = next(
+                            (tool for tool in tools if tool.name == "rename_symbol"), None
+                        )
+                        if rename_tool is None:
+                            raise RuntimeError("The rename_symbol tool is unavailable in the refactor phase.")
+                        result = await rename_tool.ainvoke(
+                            {
+                                "file_path": file_path,
+                                "old_name": old_name,
+                                "new_name": new_name,
+                            }
+                        )
+                        return sanitize_output(str(result))
+
                     system_prompt = (
                         "You are a precise code refactoring engineer.\n\n"
                         "The user's request already contains the relevant file paths found by semantic search.\n"
@@ -103,11 +161,19 @@ class RefactorAgent:
             return e.exceptions[0] if e.exceptions else e
         return e
 
-    def run_sync(self, prompt: str, phase: str = "refactor", approved: bool = False) -> str:
+    def run_sync(
+        self,
+        prompt: str,
+        phase: str = "refactor",
+        approved: bool = False,
+        repository_path: str | None = None,
+    ) -> str:
         """Helper to run the async agent in a sync context."""
         executor = ThreadPoolExecutor(max_workers=1)
         try:
-            future = executor.submit(lambda: asyncio.run(self.run(prompt, phase, approved)))
+            future = executor.submit(
+                lambda: asyncio.run(self.run(prompt, phase, approved, repository_path))
+            )
             return future.result(timeout=self.timeout_seconds)
         except FutureTimeoutError as e:
             future.cancel()

@@ -227,7 +227,8 @@ function App() {
       : 'ws://localhost:8001/ws/query';
     const ws = new WebSocket(wsUrl);
 
-    ws.onopen = () => ws.send(JSON.stringify({ question: q }));
+    const selectedRepo = repoUrl.trim().replace(/\/+$/, '').split('/').pop()?.replace(/\.git$/i, '') || '';
+    ws.onopen = () => ws.send(JSON.stringify({ question: q, repo_name: selectedRepo }));
 
     ws.onmessage = (event) => {
       const data = JSON.parse(event.data);

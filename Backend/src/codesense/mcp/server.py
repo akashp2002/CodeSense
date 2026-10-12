@@ -122,6 +122,24 @@ def _rename_identifier_nodes(source: bytes, old_name: str, new_name: str):
     return tree, replacements, len(definitions)
 
 
+def _definition_span(source: bytes, tree, name: str) -> tuple[int, int] | None:
+    definitions = []
+    for node in _walk_tree(tree.root_node):
+        if node.type not in {"function_definition", "class_definition"}:
+            continue
+        name_node = node.child_by_field_name("name")
+        if name_node and name_node.text.decode("utf-8") == name:
+            definition = node.parent if node.parent and node.parent.type == "decorated_definition" else node
+            line_start = source.rfind(b"\n", 0, definition.start_byte) + 1
+            line_end = source.find(b"\n", definition.end_byte)
+            if line_end == -1:
+                line_end = len(source)
+            else:
+                line_end += 1
+            definitions.append((line_start, line_end))
+    return definitions[0] if len(definitions) == 1 else None
+
+
 def _module_names_for_file(repo_path: Path, file_path: Path) -> set[str]:
     relative_parts = list(file_path.relative_to(repo_path).with_suffix("").parts)
     if relative_parts[-1] == "__init__":
@@ -198,6 +216,13 @@ def _apply_replacements(source: bytes, replacements: list[tuple[int, int]], new_
     updated = bytearray(source)
     for start_byte, end_byte in sorted(replacements, reverse=True):
         updated[start_byte:end_byte] = new_name.encode("utf-8")
+    return bytes(updated)
+
+
+def _apply_edits(source: bytes, edits: list[tuple[int, int, bytes]]) -> bytes:
+    updated = bytearray(source)
+    for start_byte, end_byte, replacement in sorted(edits, reverse=True):
+        updated[start_byte:end_byte] = replacement
     return bytes(updated)
 
 
@@ -338,21 +363,93 @@ def rename_symbol(file_path: str, old_name: str, new_name: str) -> str:
     except ValueError:
         return "Error: file_path must be inside the repository."
         
-    if full_path.suffix != ".py":
+    if full_path.is_file() and full_path.suffix != ".py":
         return "Error: file_path must be a Python file."
+    if not full_path.is_file() and not full_path.is_dir() and full_path.suffix != ".py":
+        return "Error: file_path must be a Python file or repository directory."
 
     try:
-        if full_path.stat().st_size > MAX_TOOL_FILE_BYTES:
-            raise GuardrailViolation("The target file exceeds the 1 MB rename limit.")
-        original = full_path.read_bytes()
-        _, replacements, definition_count = _rename_identifier_nodes(original, old_name, new_name)
+        original = b""
+        replacements = []
+        definition_count = 0
+        if full_path.is_file():
+            if full_path.stat().st_size > MAX_TOOL_FILE_BYTES:
+                raise GuardrailViolation("The target file exceeds the 1 MB rename limit.")
+            original = full_path.read_bytes()
+            _, replacements, definition_count = _rename_identifier_nodes(
+                original, old_name, new_name
+            )
+
         if definition_count == 0:
-            return f"Error: no unique function or class definition named '{old_name}' found."
+            matches = []
+            for candidate in repo_path.rglob("*.py"):
+                relative_parts = candidate.relative_to(repo_path).parts
+                if candidate == full_path or any(
+                    part in {".venv", "__pycache__", ".git", "node_modules"}
+                    for part in relative_parts
+                ):
+                    continue
+                try:
+                    candidate = validate_repository_path(repo_path, candidate)
+                    if candidate.stat().st_size > MAX_TOOL_FILE_BYTES:
+                        continue
+                    candidate_source = candidate.read_bytes()
+                    _, _, candidate_count = _rename_identifier_nodes(
+                        candidate_source, old_name, new_name
+                    )
+                except (GuardrailViolation, OSError, UnicodeError):
+                    continue
+                if candidate_count:
+                    matches.append((candidate, candidate_source, candidate_count))
+
+            if len(matches) > 1 or (matches and matches[0][2] > 1):
+                paths = ", ".join(
+                    str(candidate.relative_to(repo_path)) for candidate, _, _ in matches
+                )
+                return (
+                    f"Error: '{old_name}' has multiple definitions in the repository"
+                    f"{f' ({paths})' if paths else ''}; rename is ambiguous."
+                )
+            if matches:
+                full_path, original, definition_count = matches[0]
+                _, replacements, definition_count = _rename_identifier_nodes(
+                    original, old_name, new_name
+                )
+            else:
+                return (
+                    f"Error: no unique function or class definition named '{old_name}' "
+                    "found in the repository."
+                )
         if definition_count > 1:
             return f"Error: '{old_name}' has {definition_count} definitions in {file_path}; rename is ambiguous."
-        if not replacements:
+        tree, _, conflicting_definition_count = _rename_identifier_nodes(
+            original, new_name, old_name
+        )
+        definition_to_remove = None
+        if conflicting_definition_count:
+            definition_to_remove = _definition_span(original, tree, old_name)
+            if definition_to_remove is None:
+                return f"Error: could not safely remove the '{old_name}' definition."
+        edits = [
+            (start, end, new_name.encode("utf-8"))
+            for start, end in replacements
+            if definition_to_remove is None
+            or not (
+                definition_to_remove[0] <= start
+                and end <= definition_to_remove[1]
+            )
+        ]
+        if definition_to_remove is not None:
+            edits.append((*definition_to_remove, b""))
+        if not edits:
             return f"Error: no references resolved for '{old_name}' in {file_path}."
-        changes = {full_path: (original, _apply_replacements(original, replacements, new_name), len(replacements))}
+        changes = {
+            full_path: (
+                original,
+                _apply_edits(original, edits),
+                len(edits) - (1 if definition_to_remove is not None else 0),
+            )
+        }
         module_names = _module_names_for_file(repo_path, full_path)
         for candidate in repo_path.rglob("*.py"):
             if candidate == full_path or any(part in {".venv", "__pycache__", ".git"} for part in candidate.parts):

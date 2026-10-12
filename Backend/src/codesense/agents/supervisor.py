@@ -16,6 +16,9 @@ from codesense.guardrails import (
     validate_user_input,
 )
 from codesense.agents.semantic_search import SemanticSearchAgent
+from codesense.ingestion.parser import CodeParser, SUPPORTED_EXTENSIONS
+from codesense.ingestion.chunker import SemanticChunker
+from codesense.ingestion.symbol_table import SymbolExtractor
 from codesense.agents.dependency_graph import DependencyGraphAgent
 from codesense.agents.explainer import ExplainerAgent
 from codesense.vector_store import VectorStore
@@ -92,6 +95,14 @@ class SupervisorAgent:
 
     def _classify_intent(self, state: CodeSenseState) -> CodeSenseState:
         """Node 1: Classify the user's intent."""
+        exact_symbol = self._defined_symbol_query(state["question"])
+        if exact_symbol:
+            state["intent"] = "search"
+            state["_target_symbol"] = exact_symbol
+            state["_dependency_direction"] = None
+            state["_exact_symbol_lookup"] = True
+            return state
+
         print(f"Supervisor: Analyzing intent for '{state['question']}'")
         try:
             result = self.llm.invoke(f"Classify the following codebase question: {state['question']}")
@@ -178,10 +189,99 @@ class SupervisorAgent:
 
     def _run_semantic_search(self, state: CodeSenseState) -> CodeSenseState:
         """Node: Semantic Search Specialist"""
+        exact_symbol = self._defined_symbol_query(state["question"])
+        if exact_symbol:
+            state["_exact_symbol_lookup"] = True
+            repo_path = Path(
+                state.get("_repository_path")
+                or os.getenv("CODESENSE_REPO_PATH")
+                or Path.cwd() / "repos" / "demo"
+            ).resolve()
+            if not repo_path.is_dir():
+                state["final_answer"] = (
+                    f"I couldn't verify `{exact_symbol}` because no active repository "
+                    "is configured."
+                )
+                state["search_results"] = []
+                return state
+
+            definitions = self._find_python_definitions(repo_path, exact_symbol)
+            state["search_results"] = definitions
+            if not definitions:
+                state["final_answer"] = (
+                    f"No Python function or class named `{exact_symbol}` was found "
+                    "in the selected repository."
+                )
+            elif len(definitions) == 1:
+                definition = definitions[0]
+                state["final_answer"] = (
+                    f"`{exact_symbol}` is defined in "
+                    f"`{definition['file_path']}` (lines {definition['line_range']}).\n\n"
+                    f"```python\n{definition['snippet']}\n```"
+                )
+            else:
+                locations = "\n".join(
+                    f"- `{definition['file_path']}` (lines {definition['line_range']})"
+                    for definition in definitions
+                )
+                state["final_answer"] = (
+                    f"Found {len(definitions)} Python definitions named "
+                    f"`{exact_symbol}` in the selected repository:\n{locations}"
+                )
+            return state
+
         print("Semantic Search: Retrieving code chunks...")
         results = self.search_agent.search_codebase(state["question"], limit=5)
         state["search_results"] = results
         return state
+
+    @staticmethod
+    def _defined_symbol_query(question: str) -> str | None:
+        match = re.search(
+            r"\bwhere\s+is\s+(?:the\s+)?(?:function|class|symbol)?\s*"
+            r"`?([A-Za-z_]\w*)`?\s+defined\b",
+            question,
+            re.IGNORECASE,
+        )
+        return match.group(1) if match else None
+
+    @staticmethod
+    def _find_python_definitions(repo_path: Path, symbol: str) -> list[dict[str, str]]:
+        parser = CodeParser()
+        skipped_directories = {
+            ".git", ".venv", "__pycache__", "node_modules", "dist", "build", "target"
+        }
+        definitions = []
+
+        for file_path in repo_path.rglob("*.py"):
+            if any(part in skipped_directories for part in file_path.relative_to(repo_path).parts):
+                continue
+            tree, source = parser.parse_file(str(file_path))
+            pending = [tree.root_node]
+            while pending:
+                node = pending.pop()
+                if node.type in {"function_definition", "class_definition"}:
+                    name_node = node.child_by_field_name("name")
+                    if name_node and name_node.text.decode("utf-8") == symbol:
+                        definition_node = (
+                            node.parent
+                            if node.parent and node.parent.type == "decorated_definition"
+                            else node
+                        )
+                        definitions.append(
+                            {
+                                "file_path": file_path.relative_to(repo_path).as_posix(),
+                                "line_range": (
+                                    f"{definition_node.start_point[0] + 1}-"
+                                    f"{definition_node.end_point[0] + 1}"
+                                ),
+                                "snippet": source[
+                                    definition_node.start_byte:definition_node.end_byte
+                                ].decode("utf-8"),
+                            }
+                        )
+                pending.extend(reversed(node.children))
+        return definitions
 
     def _run_dependency_graph(self, state: CodeSenseState) -> CodeSenseState:
         """Node: Dependency Graph Specialist"""
@@ -197,7 +297,72 @@ class SupervisorAgent:
             ignore = {"What", "If", "How", "Do", "I", "Need", "The"}
             potential = [w for w in words if w not in ignore and (w[0].isupper() or '_' in w)]
             symbol = potential[0] if potential else state["question"].split()[0]
-            
+
+        repo_path = state.get("_repository_path")
+        if repo_path:
+            repository = Path(repo_path).resolve()
+            if not repository.is_dir():
+                state["error"] = "The selected repository is unavailable for dependency analysis."
+                return state
+
+            direction = state.get("_dependency_direction") or "dependents"
+            definitions, related = self._scan_repository_dependencies(
+                repository, symbol, direction
+            )
+            state["_source_dependency_analysis"] = True
+            relation = "dependents" if direction == "dependents" else "dependencies"
+            if not definitions:
+                state["impact_results"] = {
+                    "target_symbol": symbol,
+                    "direction": relation,
+                    "exists": False,
+                    "related_count": 0,
+                    "related_symbols": [],
+                }
+                state["final_answer"] = (
+                    f"No definition of `{symbol}` was found in the selected repository, "
+                    f"so I can't determine its {relation}."
+                )
+                return state
+
+            state["impact_results"] = {
+                "target_symbol": symbol,
+                "direction": relation,
+                "exists": True,
+                "definitions": definitions,
+                "related_count": len(related),
+                "related_symbols": related,
+            }
+            if related:
+                details = []
+                for item in related:
+                    origin = (
+                        f" from `{item['caller_symbol']}`"
+                        if item["caller_symbol"]
+                        else ""
+                    )
+                    details.append(
+                        f"- `{item['file_path']}` (line {item['line_number']}){origin}"
+                    )
+                relation_phrase = (
+                    "direct dependent reference"
+                    if relation == "dependents"
+                    else "direct dependency reference"
+                )
+                state["final_answer"] = (
+                    f"Found {len(related)} {relation_phrase}"
+                    f"{'s' if len(related) != 1 else ''} "
+                    f"{'to' if relation == 'dependents' else 'from'} `{symbol}` "
+                    f"in the selected repository:\n"
+                    + "\n".join(details)
+                )
+            else:
+                state["final_answer"] = (
+                    f"Found `{symbol}` in the selected repository, but detected no direct "
+                    f"{relation} in supported source files."
+                )
+            return state
+
         print(f"Dependency Graph: Traversing graph for '{symbol}'...")
         
         results = self.graph_agent.get_impact(
@@ -207,28 +372,109 @@ class SupervisorAgent:
         return state
 
     @staticmethod
+    def _scan_repository_dependencies(
+        repo_path: Path, symbol: str, direction: str
+    ) -> tuple[list[dict[str, str]], list[dict[str, str | int | None]]]:
+        parser = CodeParser()
+        chunker = SemanticChunker()
+        symbol_extractor = SymbolExtractor()
+        skipped_directories = {
+            ".git", ".venv", "__pycache__", "tests", ".qdrant_db", "node_modules",
+            ".tox", "dist", "build", "target",
+        }
+        definitions: list[dict[str, str]] = []
+        references: list[dict[str, str | int | None]] = []
+
+        for file_path in sorted(repo_path.rglob("*")):
+            relative_path = file_path.relative_to(repo_path)
+            if (
+                not file_path.is_file()
+                or file_path.suffix.lower() not in SUPPORTED_EXTENSIONS
+                or any(part in skipped_directories for part in relative_path.parts)
+            ):
+                continue
+
+            tree, source = parser.parse_file(str(file_path))
+            for chunk in chunker.chunk_node(tree.root_node, source, str(file_path)):
+                if chunk.symbol_name == symbol:
+                    definitions.append({
+                        "file_path": relative_path.as_posix(),
+                        "line_range": (
+                            f"{chunk.line_range.start_line}-{chunk.line_range.end_line}"
+                        ),
+                    })
+
+            for reference in symbol_extractor.extract_references(
+                tree.root_node, source, str(file_path)
+            ):
+                references.append({
+                    "file_path": relative_path.as_posix(),
+                    "caller_symbol": reference.caller_symbol,
+                    "symbol_name": reference.symbol_name.rsplit(".", 1)[-1],
+                    "reference_type": reference.reference_type,
+                    "line_number": reference.line_number,
+                })
+
+        if not definitions:
+            return definitions, []
+
+        related = [
+            reference
+            for reference in references
+            if (
+                reference["caller_symbol"] == symbol
+                if direction == "dependencies"
+                else reference["symbol_name"] == symbol
+            )
+        ]
+        unique_related = {
+            (
+                item["file_path"],
+                item["line_number"],
+                item["caller_symbol"],
+                item["symbol_name"],
+                item["reference_type"],
+            ): item
+            for item in related
+        }
+        return definitions, list(unique_related.values())
+
+    @staticmethod
     def _normalize_impact_target(extracted_symbol: str | None, question: str) -> str:
         """Avoid generic classifier words becoming the dependency target."""
         generic = {
             "a", "affect", "change", "changing", "effect", "effected", "files",
             "depend", "dependent", "dependents", "dependant", "dependants",
             "dependencies", "dependency", "impact", "need", "other", "replace",
-            "replacing", "what", "will",
+            "replacing", "what", "will", "where", "who", "which", "when", "why",
+            "how", "does", "is", "are", "the", "to", "on", "of", "for", "it",
         }
-        if extracted_symbol and extracted_symbol.lower() not in generic:
-            return extracted_symbol
-
         words = re.findall(r"[A-Za-z_][A-Za-z0-9_]*", question)
-        ignored = generic | {"the", "to", "does", "is", "it", "i"}
+        ignored = generic | {"i"}
         candidates = [word for word in words if word.lower() not in ignored]
         identifier_candidates = [
             word for word in candidates if "_" in word or word[:1].isupper()
         ]
         if identifier_candidates:
             return identifier_candidates[0]
+        if extracted_symbol and extracted_symbol.lower() not in generic:
+            return extracted_symbol
         if candidates:
             return candidates[0]
         return extracted_symbol or question.split()[0]
+
+    @staticmethod
+    def _route_after_dependency_graph(state: CodeSenseState) -> str:
+        if state.get("error") or state.get("_source_dependency_analysis"):
+            return "output_guardrail"
+        return "explainer"
+
+    @staticmethod
+    def _repository_relative_path(file_path: str | Path, repo_path: Path) -> str | None:
+        try:
+            return Path(file_path).resolve().relative_to(repo_path.resolve()).as_posix()
+        except ValueError:
+            return None
 
     def _refactor_node(self, state: CodeSenseState) -> CodeSenseState:
         """Node: Run the refactor agent in a sandbox.
@@ -241,8 +487,12 @@ class SupervisorAgent:
         import stat
         print(f"Refactor Agent: Processing request '{state['question']}'")
         
-        repo_path = os.getenv("CODESENSE_REPO_PATH") or str(Path.cwd() / "repos" / "demo")
-        staging_path = repo_path + "_staging"
+        repo_path = Path(
+            state.get("_repository_path")
+            or os.getenv("CODESENSE_REPO_PATH")
+            or str(Path.cwd() / "repos" / "demo")
+        ).resolve()
+        staging_path = Path(f"{repo_path}_staging")
         
         def remove_readonly(func, path, excinfo):
             os.chmod(path, stat.S_IWRITE)
@@ -264,9 +514,6 @@ class SupervisorAgent:
                         "GIT_AUTHOR_EMAIL": "bot@codesense", "GIT_COMMITTER_NAME": "CodeSense",
                         "GIT_COMMITTER_EMAIL": "bot@codesense"})
         
-        original_env_path = os.getenv("CODESENSE_REPO_PATH")
-        os.environ["CODESENSE_REPO_PATH"] = staging_path
-        
         # Build a context-enriched prompt with RELATIVE paths so the agent edits the sandbox, not live repo.
         # res['file_path'] from the vector store is an absolute path to the original repo.
         # We convert it to be relative to repo_path. The MCP server resolves it against
@@ -275,19 +522,20 @@ class SupervisorAgent:
         if state.get("search_results"):
             context = "Relevant code from the repository:\n"
             for res in state["search_results"][:5]:
-                abs_path = res['file_path']
-                try:
-                    rel_path = os.path.relpath(abs_path, repo_path)
-                except ValueError:
-                    # Different drive on Windows — use basename as best effort
-                    rel_path = os.path.basename(abs_path)
+                rel_path = self._repository_relative_path(res["file_path"], repo_path)
+                if rel_path is None:
+                    continue
                 context += f"- File: `{rel_path}` (Lines {res['line_range']})\n"
                 context += f"```\n{res['snippet']}\n```\n\n"
 
         prompt = f"{context}\nUser Request: {state['question']}"
         
         try:
-            agent_reply = self.refactor_agent.run_sync(prompt, phase="refactor")
+            agent_reply = self.refactor_agent.run_sync(
+                prompt,
+                phase="refactor",
+                repository_path=str(staging_path),
+            )
             
             # Run git diff ourselves — the agent's text reply is NOT the diff
             diff_result = subprocess.run(
@@ -326,12 +574,6 @@ class SupervisorAgent:
                 state["error"] = str(error)
         except Exception as e:
             state["error"] = f"Refactor failed: {e}"
-        finally:
-            if original_env_path is not None:
-                os.environ["CODESENSE_REPO_PATH"] = original_env_path
-            else:
-                os.environ.pop("CODESENSE_REPO_PATH", None)
-                
         return state
 
     def _refresh_indexes(self) -> str:
@@ -353,6 +595,8 @@ class SupervisorAgent:
             return f"Index refresh failed; search results may be stale: {error}"
 
     def _route_after_search(self, state: CodeSenseState) -> str:
+        if state.get("_exact_symbol_lookup"):
+            return "output_guardrail"
         if state.get("intent") == "refactor":
             return "refactor_node"
         return "explainer"
@@ -395,12 +639,16 @@ class SupervisorAgent:
             {
                 "explainer": "explainer",
                 "refactor_node": "refactor_node",
+                "output_guardrail": "output_guardrail",
                 END: END
             }
         )
         
-        # After dependency graph, always go to explainer to synthesize
-        workflow.add_edge("dependency_graph", "explainer")
+        workflow.add_conditional_edges(
+            "dependency_graph",
+            self._route_after_dependency_graph,
+            {"explainer": "explainer", "output_guardrail": "output_guardrail"},
+        )
         
         # After refactor, we're done (UI shows approval)
         workflow.add_edge("refactor_node", "output_guardrail")
@@ -426,6 +674,9 @@ class SupervisorAgent:
             intent=None,
             _target_symbol=None,
             _dependency_direction=None,
+            _exact_symbol_lookup=False,
+            _source_dependency_analysis=False,
+            _repository_path=None,
             search_results=None,
             impact_results=None,
             final_answer=None,

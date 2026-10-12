@@ -11,7 +11,7 @@ from typing import Optional
 from dotenv import load_dotenv
 from sqlalchemy.orm import Session
 
-from codesense.database import get_db, User, ChatSession
+from codesense.database import get_db_session, User, ChatSession
 from codesense.auth import (
     get_current_user, 
     verify_password, 
@@ -131,7 +131,7 @@ def verify_api_key(user: User = Depends(get_current_user)):
 # ── Auth Endpoints ──
 
 @app.post("/register")
-def register(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
+def register(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db_session)):
     user = db.query(User).filter(User.email == form_data.username).first()
     if user:
         raise HTTPException(
@@ -154,7 +154,7 @@ def register(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Dep
     return {"access_token": access_token, "token_type": "bearer"}
 
 @app.post("/login")
-def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
+def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db_session)):
     user = db.query(User).filter(User.email == form_data.username).first()
     if not user or not verify_password(form_data.password, user.hashed_password):
         # Fallback to auto-registration for demo purposes if user doesn't exist
@@ -180,7 +180,7 @@ def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depend
     return {"access_token": access_token, "token_type": "bearer"}
 
 @app.post("/guest")
-def login_guest(db: Session = Depends(get_db)):
+def login_guest(db: Session = Depends(get_db_session)):
     guest_user = User(is_guest=True)
     db.add(guest_user)
     db.commit()
@@ -199,14 +199,14 @@ class HistoryRequest(BaseModel):
     history: str
 
 @app.get("/history", dependencies=[Depends(verify_api_key)])
-def get_history(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+def get_history(user: User = Depends(get_current_user), db: Session = Depends(get_db_session)):
     session = db.query(ChatSession).filter(ChatSession.user_id == user.id).order_by(ChatSession.id.desc()).first()
     if not session:
         return {"history": "[]"}
     return {"history": session.history or "[]"}
 
 @app.post("/history", dependencies=[Depends(verify_api_key)])
-def save_history(request: HistoryRequest, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+def save_history(request: HistoryRequest, user: User = Depends(get_current_user), db: Session = Depends(get_db_session)):
     session = db.query(ChatSession).filter(ChatSession.user_id == user.id).order_by(ChatSession.id.desc()).first()
     if not session:
         session = ChatSession(user_id=user.id, repo_path="default", history=request.history)
@@ -516,6 +516,28 @@ async def websocket_query(websocket: WebSocket, token: Optional[str] = None):
         except GuardrailViolation as error:
             await websocket.send_json({"type": "error", "message": str(error)})
             return
+
+        repo_name = data.get("repo_name")
+        if (
+            not isinstance(repo_name, str)
+            or not re.fullmatch(r"[A-Za-z0-9_.-]{1,100}", repo_name)
+            or repo_name in {".", ".."}
+        ):
+            await websocket.send_json(
+                {"type": "error", "message": "Select a valid repository before querying."}
+            )
+            return
+        user_repos = Path(__file__).resolve().parents[2] / "repos" / str(user_id)
+        try:
+            selected_repo = validate_repository_path(user_repos, repo_name)
+        except GuardrailViolation as error:
+            await websocket.send_json({"type": "error", "message": str(error)})
+            return
+        if not selected_repo.is_dir():
+            await websocket.send_json(
+                {"type": "error", "message": "The selected repository is not available. Clone it before querying."}
+            )
+            return
             
         agent = get_supervisor(user_id)
         
@@ -525,6 +547,11 @@ async def websocket_query(websocket: WebSocket, token: Optional[str] = None):
         initial_state = CodeSenseState(
             question=question,
             intent=None,
+            _target_symbol=None,
+            _dependency_direction=None,
+            _exact_symbol_lookup=False,
+            _source_dependency_analysis=False,
+            _repository_path=str(selected_repo),
             search_results=None,
             impact_results=None,
             final_answer=None,
