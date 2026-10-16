@@ -147,7 +147,7 @@ def test_impact_target_ignores_action_words():
     ) == "get_db_sessions"
 
 
-def test_dependency_analysis_rejects_symbol_missing_from_selected_repository(tmp_path):
+def test_dependency_analysis_corrects_unique_near_match_without_references(tmp_path):
     repository = tmp_path / "selected"
     database_file = repository / "backend" / "app" / "core" / "database.py"
     database_file.parent.mkdir(parents=True)
@@ -171,8 +171,11 @@ def test_dependency_analysis_rejects_symbol_missing_from_selected_repository(tmp
 
     result = agent._run_dependency_graph(state)
 
-    assert result["impact_results"]["exists"] is False
-    assert "No definition of `get_db_sessions`" in result["final_answer"]
+    assert result["impact_results"]["exists"] is True
+    assert result["impact_results"]["target_symbol"] == "get_db_session"
+    assert result["impact_results"]["related_count"] == 0
+    assert "`get_db_sessions` was not found" in result["final_answer"]
+    assert "`get_db_session`" in result["final_answer"]
     assert "safe to change" not in result["final_answer"]
     assert SupervisorAgent._route_after_dependency_graph(result) == "output_guardrail"
 
@@ -205,6 +208,37 @@ def test_dependency_analysis_reports_source_references_in_selected_repository(tm
     assert result["impact_results"]["related_symbols"][0]["caller_symbol"] == "get_user"
     assert "`routes.py`" in result["final_answer"]
     assert "get_user" in result["final_answer"]
+
+
+def test_dependency_analysis_corrects_unique_near_match_and_reports_dependents(tmp_path):
+    repository = tmp_path / "selected"
+    repository.mkdir()
+    (repository / "database.py").write_text(
+        "async def get_db_sessions():\n"
+        "    yield None\n",
+        encoding="utf-8",
+    )
+    (repository / "auth.py").write_text(
+        "from database import get_db_sessions\n"
+        "def login():\n"
+        "    return get_db_sessions()\n",
+        encoding="utf-8",
+    )
+    agent = SupervisorAgent.__new__(SupervisorAgent)
+    state = {
+        "question": "but when get_db_sesion dependant to?",
+        "_target_symbol": "get_db_sesion",
+        "_dependency_direction": "dependents",
+        "_repository_path": str(repository),
+    }
+
+    result = agent._run_dependency_graph(state)
+
+    assert result["impact_results"]["target_symbol"] == "get_db_sessions"
+    assert result["impact_results"]["related_count"] == 2
+    assert "`get_db_sesion` was not found" in result["final_answer"]
+    assert "`get_db_sessions`" in result["final_answer"]
+    assert "`auth.py`" in result["final_answer"]
 
 
 def test_dependency_question_direction():

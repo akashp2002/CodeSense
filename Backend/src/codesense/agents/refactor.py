@@ -10,7 +10,7 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from langchain_mcp_adapters.tools import load_mcp_tools
 import asyncio
-from codesense.guardrails import sanitize_output
+from codesense.guardrails import log_guardrail_denial, sanitize_output
 
 
 class RefactorAgent:
@@ -60,6 +60,8 @@ class RefactorAgent:
         phase: str = "refactor",
         approved: bool = False,
         repository_path: str | None = None,
+        audit_user_id: str | None = None,
+        audit_session_id: str | None = None,
     ) -> str:
         """
         Run the refactor agent in the specified phase using MCP tools.
@@ -68,6 +70,13 @@ class RefactorAgent:
         if phase not in {"refactor", "push"}:
             raise ValueError(f"Unsupported refactor phase: {phase}")
         if phase == "push" and not approved:
+            log_guardrail_denial(
+                "refactor_phase",
+                {"phase": phase, "prompt": prompt},
+                "Push-phase tools require explicit human approval.",
+                user_id=audit_user_id,
+                session_id=audit_session_id,
+            )
             raise PermissionError("Push-phase tools require explicit human approval.")
 
         server_params = StdioServerParameters(
@@ -78,6 +87,16 @@ class RefactorAgent:
                 **({"CODESENSE_REPO_PATH": repository_path} if repository_path else {}),
                 "CODESENSE_TOOL_PHASE": phase,
                 "CODESENSE_TOOL_APPROVED": "1" if approved else "0",
+                **(
+                    {"CODESENSE_AUDIT_USER_ID": audit_user_id}
+                    if audit_user_id is not None
+                    else {}
+                ),
+                **(
+                    {"CODESENSE_AUDIT_SESSION_ID": audit_session_id}
+                    if audit_session_id is not None
+                    else {}
+                ),
             },
         )
 
@@ -167,12 +186,23 @@ class RefactorAgent:
         phase: str = "refactor",
         approved: bool = False,
         repository_path: str | None = None,
+        audit_user_id: str | None = None,
+        audit_session_id: str | None = None,
     ) -> str:
         """Helper to run the async agent in a sync context."""
         executor = ThreadPoolExecutor(max_workers=1)
         try:
             future = executor.submit(
-                lambda: asyncio.run(self.run(prompt, phase, approved, repository_path))
+                lambda: asyncio.run(
+                    self.run(
+                        prompt,
+                        phase,
+                        approved,
+                        repository_path,
+                        audit_user_id,
+                        audit_session_id,
+                    )
+                )
             )
             return future.result(timeout=self.timeout_seconds)
         except FutureTimeoutError as e:

@@ -37,6 +37,7 @@ from qdrant_client import QdrantClient
 from codesense.guardrails import (
     GuardrailViolation,
     contains_sensitive_data,
+    log_guardrail_denial,
     sanitize_data,
     sanitize_output,
     validate_repository_path,
@@ -354,6 +355,13 @@ def api_delete_repository(request: DeleteRepositoryRequest, user: User = Depends
     # Ensure multi-tenant security
     expected_prefix = f"repos/{user.id}/"
     if not request.repo_path.replace("\\", "/").startswith(expected_prefix):
+        log_guardrail_denial(
+            "delete_repository",
+            request.repo_path,
+            "Not authorized to delete this repository.",
+            user_id=user.id,
+            session_id=secrets.token_hex(16),
+        )
         raise HTTPException(status_code=403, detail="Not authorized to delete this repository.")
         
     reset_supervisor(user.id)
@@ -372,6 +380,13 @@ def api_index_vectors(request: IndexRequest, user: User = Depends(get_current_us
     """Build the semantic vector index for a local repository path."""
     expected_prefix = f"repos/{user.id}/"
     if not request.repo_path.replace("\\", "/").startswith(expected_prefix):
+        log_guardrail_denial(
+            "index_vectors",
+            request.repo_path,
+            "Not authorized to index this repository.",
+            user_id=user.id,
+            session_id=secrets.token_hex(16),
+        )
         raise HTTPException(status_code=403, detail="Not authorized to index this repository.")
         
     if not os.path.exists(request.repo_path):
@@ -438,6 +453,13 @@ def api_index_graph(request: IndexRequest, user: User = Depends(get_current_user
     """Build the Neo4j dependency graph for a local repository path."""
     expected_prefix = f"repos/{user.id}/"
     if not request.repo_path.replace("\\", "/").startswith(expected_prefix):
+        log_guardrail_denial(
+            "index_graph",
+            request.repo_path,
+            "Not authorized to index this repository.",
+            user_id=user.id,
+            session_id=secrets.token_hex(16),
+        )
         raise HTTPException(status_code=403, detail="Not authorized to index this repository.")
         
     if not os.path.exists(request.repo_path):
@@ -491,6 +513,7 @@ import traceback
 
 @app.websocket("/ws/query")
 async def websocket_query(websocket: WebSocket, token: Optional[str] = None):
+    audit_session_id = secrets.token_hex(16)
     try:
         if not token:
             await websocket.close(code=1008, reason="Missing auth token")
@@ -514,6 +537,13 @@ async def websocket_query(websocket: WebSocket, token: Optional[str] = None):
         try:
             question = validate_user_input(question)
         except GuardrailViolation as error:
+            log_guardrail_denial(
+                "websocket_query",
+                question,
+                str(error),
+                user_id=user_id,
+                session_id=audit_session_id,
+            )
             await websocket.send_json({"type": "error", "message": str(error)})
             return
 
@@ -523,6 +553,13 @@ async def websocket_query(websocket: WebSocket, token: Optional[str] = None):
             or not re.fullmatch(r"[A-Za-z0-9_.-]{1,100}", repo_name)
             or repo_name in {".", ".."}
         ):
+            log_guardrail_denial(
+                "repository_selection",
+                repo_name,
+                "Select a valid repository before querying.",
+                user_id=user_id,
+                session_id=audit_session_id,
+            )
             await websocket.send_json(
                 {"type": "error", "message": "Select a valid repository before querying."}
             )
@@ -531,11 +568,26 @@ async def websocket_query(websocket: WebSocket, token: Optional[str] = None):
         try:
             selected_repo = validate_repository_path(user_repos, repo_name)
         except GuardrailViolation as error:
+            log_guardrail_denial(
+                "repository_selection",
+                repo_name,
+                str(error),
+                user_id=user_id,
+                session_id=audit_session_id,
+            )
             await websocket.send_json({"type": "error", "message": str(error)})
             return
         if not selected_repo.is_dir():
+            reason = "The selected repository is not available. Clone it before querying."
+            log_guardrail_denial(
+                "repository_selection",
+                repo_name,
+                reason,
+                user_id=user_id,
+                session_id=audit_session_id,
+            )
             await websocket.send_json(
-                {"type": "error", "message": "The selected repository is not available. Clone it before querying."}
+                {"type": "error", "message": reason}
             )
             return
             
@@ -551,6 +603,8 @@ async def websocket_query(websocket: WebSocket, token: Optional[str] = None):
             _dependency_direction=None,
             _exact_symbol_lookup=False,
             _source_dependency_analysis=False,
+            _audit_user_id=str(user_id),
+            _audit_session_id=audit_session_id,
             _repository_path=str(selected_repo),
             search_results=None,
             impact_results=None,
@@ -627,9 +681,13 @@ def api_search(
     user: User = Depends(get_current_user),
 ):
     """Semantic search across codebase."""
+    audit_session_id = secrets.token_hex(16)
     try:
         q = validate_user_input(q)
     except GuardrailViolation as error:
+        log_guardrail_denial(
+            "search_query", q, str(error), user_id=user.id, session_id=audit_session_id
+        )
         raise HTTPException(status_code=422, detail=str(error)) from error
     agent = get_supervisor(user.id).search_agent
     results = agent.search_codebase(q, limit=limit)
@@ -642,9 +700,17 @@ def api_impact(
     user: User = Depends(get_current_user),
 ):
     """Dependency impact analysis for a symbol."""
+    audit_session_id = secrets.token_hex(16)
     try:
         symbol = validate_user_input(symbol)
     except GuardrailViolation as error:
+        log_guardrail_denial(
+            "impact_query",
+            symbol,
+            str(error),
+            user_id=user.id,
+            session_id=audit_session_id,
+        )
         raise HTTPException(status_code=422, detail=str(error)) from error
     agent = get_supervisor(user.id).graph_agent
     results = agent.get_impact(symbol, max_hops=hops)
@@ -657,9 +723,17 @@ def api_graph_neighborhood(
     user: User = Depends(get_current_user),
 ):
     """Get raw graph nodes and edges for visualization."""
+    audit_session_id = secrets.token_hex(16)
     try:
         symbol = validate_user_input(symbol)
     except GuardrailViolation as error:
+        log_guardrail_denial(
+            "graph_query",
+            symbol,
+            str(error),
+            user_id=user.id,
+            session_id=audit_session_id,
+        )
         raise HTTPException(status_code=422, detail=str(error)) from error
     store = get_supervisor(user.id).graph_agent.graph_store
     return sanitize_data(store.get_neighborhood(symbol, max_hops=hops))
@@ -667,13 +741,21 @@ def api_graph_neighborhood(
 @app.post("/query", response_model=QueryResponse)
 def api_query(request: QueryRequest, user: User = Depends(get_current_user)):
     """Natural language Q&A using the LangGraph Supervisor."""
+    audit_session_id = secrets.token_hex(16)
     try:
         question = validate_user_input(request.question)
     except GuardrailViolation as error:
+        log_guardrail_denial(
+            "query",
+            request.question,
+            str(error),
+            user_id=user.id,
+            session_id=audit_session_id,
+        )
         raise HTTPException(status_code=422, detail=str(error)) from error
     agent = get_supervisor(user.id)
     try:
-        result_state = agent.run(question)
+        result_state = agent.run(question, audit_session_id=audit_session_id)
         if "error" in result_state and result_state["error"]:
             raise HTTPException(status_code=500, detail=result_state["error"])
             
@@ -699,6 +781,7 @@ def api_create_pr(request: CreatePRRequest, user: User = Depends(get_current_use
     import subprocess
     import shutil
     import stat
+    audit_session_id = secrets.token_hex(16)
     
     def remove_readonly(func, path, excinfo):
         os.chmod(path, stat.S_IWRITE)
@@ -709,10 +792,31 @@ def api_create_pr(request: CreatePRRequest, user: User = Depends(get_current_use
     
     try:
         if not re.fullmatch(r"[A-Za-z0-9_.-]{1,100}", request.repo_name) or request.repo_name in {".", ".."}:
+            log_guardrail_denial(
+                "create_pull_request",
+                request.repo_name,
+                "Invalid repository name.",
+                user_id=user.id,
+                session_id=audit_session_id,
+            )
             raise HTTPException(status_code=422, detail="Invalid repository name.")
         if not request.prompt.strip() or len(request.prompt) > 4_000:
+            log_guardrail_denial(
+                "create_pull_request",
+                request.prompt,
+                "PR description must contain 1 to 4,000 characters.",
+                user_id=user.id,
+                session_id=audit_session_id,
+            )
             raise HTTPException(status_code=422, detail="PR description must contain 1 to 4,000 characters.")
         if contains_sensitive_data(request.prompt):
+            log_guardrail_denial(
+                "create_pull_request",
+                request.prompt,
+                "PR description cannot contain credential-like values.",
+                user_id=user.id,
+                session_id=audit_session_id,
+            )
             raise HTTPException(status_code=422, detail="PR description cannot contain credential-like values.")
 
         user_repos = (Path("repos") / str(user.id)).resolve()
@@ -731,6 +835,13 @@ def api_create_pr(request: CreatePRRequest, user: User = Depends(get_current_use
         ).stdout.strip().splitlines()
         changed_files = [f for f in changed_files if f.strip()]
         if not changed_files:
+            log_guardrail_denial(
+                "approve_pull_request",
+                request.repo_name,
+                "There are no staged changes to approve.",
+                user_id=user.id,
+                session_id=audit_session_id,
+            )
             raise HTTPException(status_code=400, detail="There are no staged changes to approve.")
         proposed_diff = subprocess.run(
             ["git", "--no-pager", "diff", "--no-ext-diff"],
@@ -740,9 +851,20 @@ def api_create_pr(request: CreatePRRequest, user: User = Depends(get_current_use
             check=True,
         ).stdout
         if len(proposed_diff) > 50_000 or contains_sensitive_data(proposed_diff):
+            reason = (
+                "The proposed changes exceed the safe output limit or contain "
+                "credential-like values."
+            )
+            log_guardrail_denial(
+                "approve_pull_request",
+                proposed_diff,
+                reason,
+                user_id=user.id,
+                session_id=audit_session_id,
+            )
             raise HTTPException(
                 status_code=422,
-                detail="The proposed changes exceed the safe output limit or contain credential-like values.",
+                detail=reason,
             )
         
         # Step 2: Copy changed files from staging back to main repo
@@ -795,6 +917,13 @@ def api_reindex(request: IndexRequest, user: User = Depends(get_current_user)):
     """Force a full re-index of the specified repository."""
     expected_prefix = f"repos/{user.id}/"
     if not request.repo_path.replace("\\", "/").startswith(expected_prefix):
+        log_guardrail_denial(
+            "reindex_repository",
+            request.repo_path,
+            "Not authorized to re-index this repository.",
+            user_id=user.id,
+            session_id=secrets.token_hex(16),
+        )
         raise HTTPException(status_code=403, detail="Not authorized to re-index this repository.")
         
     repo_path = request.repo_path

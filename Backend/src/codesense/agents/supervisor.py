@@ -1,4 +1,5 @@
 import os
+import difflib
 import re
 import subprocess
 from pathlib import Path
@@ -12,6 +13,7 @@ from codesense.guardrails import (
     MAX_DIFF_CHARS,
     GuardrailViolation,
     contains_sensitive_data,
+    log_guardrail_denial,
     sanitize_output,
     validate_user_input,
 )
@@ -66,6 +68,13 @@ class SupervisorAgent:
         try:
             state["question"] = validate_user_input(state.get("question"))
         except GuardrailViolation as error:
+            log_guardrail_denial(
+                "query",
+                state.get("question"),
+                str(error),
+                user_id=state.get("_audit_user_id"),
+                session_id=state.get("_audit_session_id"),
+            )
             state["error"] = str(error)
         return state
 
@@ -81,8 +90,15 @@ class SupervisorAgent:
 
         diff = state.get("diff_data")
         if diff:
-            sanitized_diff = sanitize_output(diff, MAX_DIFF_CHARS)
+            sanitized_diff = sanitize_output(diff, MAX_DIFF_CHARS, format_hint="diff")
             if len(diff) > MAX_DIFF_CHARS or contains_sensitive_data(diff) or sanitized_diff != diff:
+                log_guardrail_denial(
+                    "refactor_diff",
+                    diff,
+                    "The proposed changes exceed the safe output limit or contain sensitive data.",
+                    user_id=state.get("_audit_user_id"),
+                    session_id=state.get("_audit_session_id"),
+                )
                 state["diff_data"] = None
                 state["requires_approval"] = False
                 state["error"] = (
@@ -306,7 +322,7 @@ class SupervisorAgent:
                 return state
 
             direction = state.get("_dependency_direction") or "dependents"
-            definitions, related = self._scan_repository_dependencies(
+            definitions, related, resolved_symbol = self._scan_repository_dependencies(
                 repository, symbol, direction
             )
             state["_source_dependency_analysis"] = True
@@ -326,13 +342,19 @@ class SupervisorAgent:
                 return state
 
             state["impact_results"] = {
-                "target_symbol": symbol,
+                "target_symbol": resolved_symbol,
                 "direction": relation,
                 "exists": True,
                 "definitions": definitions,
                 "related_count": len(related),
                 "related_symbols": related,
             }
+            correction = (
+                f"`{symbol}` was not found; using the matching definition "
+                f"`{resolved_symbol}` instead.\n\n"
+                if resolved_symbol != symbol
+                else ""
+            )
             if related:
                 details = []
                 for item in related:
@@ -350,15 +372,17 @@ class SupervisorAgent:
                     else "direct dependency reference"
                 )
                 state["final_answer"] = (
-                    f"Found {len(related)} {relation_phrase}"
+                    correction
+                    + f"Found {len(related)} {relation_phrase}"
                     f"{'s' if len(related) != 1 else ''} "
-                    f"{'to' if relation == 'dependents' else 'from'} `{symbol}` "
+                    f"{'to' if relation == 'dependents' else 'from'} `{resolved_symbol}` "
                     f"in the selected repository:\n"
                     + "\n".join(details)
                 )
             else:
                 state["final_answer"] = (
-                    f"Found `{symbol}` in the selected repository, but detected no direct "
+                    correction
+                    + f"Found `{resolved_symbol}` in the selected repository, but detected no direct "
                     f"{relation} in supported source files."
                 )
             return state
@@ -374,7 +398,7 @@ class SupervisorAgent:
     @staticmethod
     def _scan_repository_dependencies(
         repo_path: Path, symbol: str, direction: str
-    ) -> tuple[list[dict[str, str]], list[dict[str, str | int | None]]]:
+    ) -> tuple[list[dict[str, str]], list[dict[str, str | int | None]], str]:
         parser = CodeParser()
         chunker = SemanticChunker()
         symbol_extractor = SymbolExtractor()
@@ -382,7 +406,7 @@ class SupervisorAgent:
             ".git", ".venv", "__pycache__", "tests", ".qdrant_db", "node_modules",
             ".tox", "dist", "build", "target",
         }
-        definitions: list[dict[str, str]] = []
+        definitions_by_symbol: dict[str, list[dict[str, str]]] = {}
         references: list[dict[str, str | int | None]] = []
 
         for file_path in sorted(repo_path.rglob("*")):
@@ -397,7 +421,14 @@ class SupervisorAgent:
             tree, source = parser.parse_file(str(file_path))
             for chunk in chunker.chunk_node(tree.root_node, source, str(file_path)):
                 if chunk.symbol_name == symbol:
-                    definitions.append({
+                    definitions_by_symbol.setdefault(symbol, []).append({
+                        "file_path": relative_path.as_posix(),
+                        "line_range": (
+                            f"{chunk.line_range.start_line}-{chunk.line_range.end_line}"
+                        ),
+                    })
+                else:
+                    definitions_by_symbol.setdefault(chunk.symbol_name, []).append({
                         "file_path": relative_path.as_posix(),
                         "line_range": (
                             f"{chunk.line_range.start_line}-{chunk.line_range.end_line}"
@@ -415,16 +446,39 @@ class SupervisorAgent:
                     "line_number": reference.line_number,
                 })
 
+        resolved_symbol = symbol
+        if resolved_symbol not in definitions_by_symbol:
+            close_matches = difflib.get_close_matches(
+                symbol,
+                sorted(definitions_by_symbol),
+                n=2,
+                cutoff=0.85,
+            )
+            if close_matches:
+                best_score = difflib.SequenceMatcher(
+                    None, symbol.casefold(), close_matches[0].casefold()
+                ).ratio()
+                next_score = (
+                    difflib.SequenceMatcher(
+                        None, symbol.casefold(), close_matches[1].casefold()
+                    ).ratio()
+                    if len(close_matches) > 1
+                    else 0
+                )
+                if best_score >= 0.85 and best_score - next_score >= 0.08:
+                    resolved_symbol = close_matches[0]
+
+        definitions = definitions_by_symbol.get(resolved_symbol, [])
         if not definitions:
-            return definitions, []
+            return definitions, [], symbol
 
         related = [
             reference
             for reference in references
             if (
-                reference["caller_symbol"] == symbol
+                reference["caller_symbol"] == resolved_symbol
                 if direction == "dependencies"
-                else reference["symbol_name"] == symbol
+                else reference["symbol_name"] == resolved_symbol
             )
         ]
         unique_related = {
@@ -437,7 +491,7 @@ class SupervisorAgent:
             ): item
             for item in related
         }
-        return definitions, list(unique_related.values())
+        return definitions, list(unique_related.values()), resolved_symbol
 
     @staticmethod
     def _normalize_impact_target(extracted_symbol: str | None, question: str) -> str:
@@ -535,6 +589,8 @@ class SupervisorAgent:
                 prompt,
                 phase="refactor",
                 repository_path=str(staging_path),
+                audit_user_id=state.get("_audit_user_id"),
+                audit_session_id=state.get("_audit_session_id"),
             )
             
             # Run git diff ourselves — the agent's text reply is NOT the diff
@@ -659,11 +715,18 @@ class SupervisorAgent:
 
         return workflow.compile()
 
-    def run(self, question: str) -> dict:
+    def run(self, question: str, audit_session_id: str | None = None) -> dict:
         """Execute the LangGraph workflow for a given question and return the state dict."""
         try:
             question = validate_user_input(question)
         except GuardrailViolation as error:
+            log_guardrail_denial(
+                "query",
+                question,
+                str(error),
+                user_id=self.user_id,
+                session_id=audit_session_id,
+            )
             return {"error": str(error)}
 
         if not os.getenv("GROQ_API_KEY"):
@@ -676,6 +739,8 @@ class SupervisorAgent:
             _dependency_direction=None,
             _exact_symbol_lookup=False,
             _source_dependency_analysis=False,
+            _audit_user_id=str(self.user_id),
+            _audit_session_id=audit_session_id,
             _repository_path=None,
             search_results=None,
             impact_results=None,

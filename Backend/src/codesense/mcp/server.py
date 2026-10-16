@@ -12,6 +12,7 @@ from tree_sitter import Language, Parser
 from codesense.guardrails import (
     GuardrailViolation,
     authorize_tool_call,
+    log_guardrail_denial,
     sanitize_output,
     validate_repository_path,
 )
@@ -26,7 +27,15 @@ def guarded_tool(function):
     @wraps(function)
     def guarded(*args, **kwargs):
         authorize_tool_call(function.__name__)
-        result = function(*args, **kwargs)
+        try:
+            result = function(*args, **kwargs)
+        except GuardrailViolation as error:
+            log_guardrail_denial(
+                "tool_call",
+                {"tool": function.__name__, "arguments": kwargs or args},
+                str(error),
+            )
+            raise
         return sanitize_output(result, MAX_TOOL_TEXT_CHARS) if isinstance(result, str) else result
 
     return guarded
@@ -312,6 +321,8 @@ def read_file(file_path: str) -> str:
         with open(full_path, "r", encoding="utf-8") as f:
             lines = f.readlines()
             return "\n".join(f"{i+1:4d} | {line.rstrip()}" for i, line in enumerate(lines))
+    except GuardrailViolation:
+        raise
     except Exception as e:
         return f"Error reading file: {e}"
 
@@ -343,6 +354,8 @@ def replace_in_file(file_path: str, search_string: str, replacement_string: str)
             raise GuardrailViolation("The edited file would exceed the 1 MB tool limit.")
         full_path.write_text(updated_content, encoding="utf-8")
         return f"Successfully replaced occurrences in {file_path}."
+    except GuardrailViolation:
+        raise
     except Exception as e:
         return f"Error replacing in file: {e}"
 
@@ -351,9 +364,9 @@ def replace_in_file(file_path: str, search_string: str, replacement_string: str)
 def rename_symbol(file_path: str, old_name: str, new_name: str) -> str:
     """Rename a Python function or class and its resolved imports across the repository."""
     if not old_name.isidentifier() or not new_name.isidentifier():
-        return "Error: old_name and new_name must be valid Python identifiers."
+        raise GuardrailViolation("old_name and new_name must be valid Python identifiers.")
     if old_name == new_name:
-        return "Error: old_name and new_name must be different."
+        raise GuardrailViolation("old_name and new_name must be different.")
 
     repo_path = get_repo_path()
     full_path = _get_safe_path(repo_path, file_path)
@@ -488,6 +501,8 @@ def rename_symbol(file_path: str, old_name: str, new_name: str) -> str:
         warning = f" Validation warning: {'; '.join(validation_warnings)}" if validation_warnings else ""
         identifier_count = sum(change[2] for change in changes.values())
         return f"Renamed {identifier_count} resolved identifier(s) across {len(changes)} file(s).{warning}"
+    except GuardrailViolation:
+        raise
     except Exception as e:
         return f"Error renaming symbol: {e}"
 
